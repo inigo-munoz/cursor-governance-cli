@@ -1,0 +1,23 @@
+# ~/.gitignore_global
+# Configuración global de git para ignorar archivos de tooling local
+#
+# Activar con:
+#   git config --global core.excludesfile ~/.gitignore_global
+
+# IAGT Governance (archivos locales generados)
+.cursor/
+.iagt-governance.yml.generated
+
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs locales
+*.log

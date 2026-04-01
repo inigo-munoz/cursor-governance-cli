@@ -1,0 +1,3314 @@
+#!/bin/bash
+# iagt-governance — CLI para gestión de gobernanza multi-stack
+# Versión: 1.0.0
+#
+# Uso:
+#   iagt-governance install       Instala catálogo local
+#   iagt-governance apply         Genera rule para proyecto actual
+#   iagt-governance update        Actualiza stacks del catálogo
+#   iagt-governance status        Muestra estado del proyecto
+#   iagt-governance verify        Verifica integridad de rule activa
+
+set -euo pipefail
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+IAGT_HOME="${IAGT_HOME:-$HOME/.iagt}"
+GOVERNANCE_DIR="$IAGT_HOME/governance"
+CONFIG_FILE="$GOVERNANCE_DIR/config.yml"
+# CLI root (parent of bin/); used to load rulesets/<stack>/<domain>_patterns.sh
+CLI_DIR=""
+[ -n "${BASH_SOURCE[0]:-}" ] && CLI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" || true
+
+CURSOR_RULES_DIR=".cursor/rules"
+GOV_STACK_RULE="$CURSOR_RULES_DIR/governance-stack.mdc" # Governance entrypoint para Cursor (MDC format)
+GOV_SECURITY_RULE="$CURSOR_RULES_DIR/governance-security.mdc" # Security rules — carga con globs PHP/Smarty
+GOV_MODULES_RULE="$CURSOR_RULES_DIR/governance-modules.mdc"  # Arquitectura/convenciones — carga con globs modules/
+PIN_FILE=".iagt-governance.yml"
+GENERATED_FILE=".iagt-governance.yml.generated"
+
+GITIGNORE_GLOBAL="$HOME/.gitignore_global"
+
+# Repos por defecto (SSH)
+DEFAULT_CORE_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-core.git"
+DEFAULT_PRESTASHOP_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-prestashop.git"
+DEFAULT_MAGENTO_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-magento.git"
+
+# Repos fallback (HTTPS)
+DEFAULT_CORE_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-core.git"
+DEFAULT_PRESTASHOP_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-prestashop.git"
+DEFAULT_MAGENTO_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-magento.git"
+DEFAULT_NODEJS_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-nodejs.git"
+DEFAULT_NODEJS_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-nodejs.git"
+
+# Variables globales para repos activos
+CORE_REPO=""
+PRESTASHOP_REPO=""
+MAGENTO_REPO=""
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info()  { echo -e "${BLUE}[INFO]${NC}  $1"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+check_dependencies() {
+  local missing=()
+  command -v git >/dev/null 2>&1 || missing+=("git")
+  command -v grep >/dev/null 2>&1 || missing+=("grep")
+  
+  if [ ${#missing[@]} -gt 0 ]; then
+    log_error "Dependencias faltantes: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Check SSH access to Bitbucket
+check_ssh_access() {
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -T git@bitbucket.org 2>&1 | grep -q "authenticated\|logged in"; then
+    return 0
+  fi
+  return 1
+}
+
+# Determinar qué protocolo usar (SSH o HTTPS)
+
+# ============================================================
+# MANIFEST & REGISTRY READERS
+# ============================================================
+
+# Leer un campo del manifest YAML del stack (parseo mínimo sin dependencias)
+# Uso: read_manifest_field <stack_dir> <yaml_path>
+# Ejemplos:
+#   read_manifest_field "$stack_dir" "cli.main_rule"
+#   read_manifest_field "$stack_dir" "cli.security.file"
+#   read_manifest_field "$stack_dir" "cli.security.globs"
+read_manifest_field() {
+  local stack_dir="$1"
+  local field_path="$2"
+  local manifest="$stack_dir/manifest/stack-manifest.yml"
+
+  [ -f "$manifest" ] || return 1
+
+  # Convertir "cli.security.file" en búsqueda por secciones YAML
+  local IFS='.'; read -ra parts <<< "$field_path"; unset IFS
+
+  python3 - "$manifest" "${parts[@]}" << 'PYEOF'
+import sys, re
+
+def parse_yaml_value(path, keys):
+    """Parseo mínimo de YAML — solo campos escalares con indentación."""
+    with open(path) as f:
+        lines = f.readlines()
+
+    indent_stack = []  # (indent_level, key)
+    target = list(keys)
+    current_depth = 0
+
+    for line in lines:
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith('#'):
+            continue
+        indent = len(stripped) - len(stripped.lstrip())
+        m = re.match(r'\s*(\S[^:]*?):\s*(.*)', stripped)
+        if not m:
+            continue
+        key, value = m.group(1).strip(), m.group(2).strip()
+
+        # Mantener stack de indentación
+        while indent_stack and indent_stack[-1][0] >= indent:
+            indent_stack.pop()
+        indent_stack.append((indent, key))
+
+        current_path = [k for _, k in indent_stack]
+        if current_path == target:
+            # Limpiar comillas
+            value = value.strip('"\'\' ')
+            if value:
+                print(value)
+            return
+
+if __name__ == '__main__':
+    parse_yaml_value(sys.argv[1], sys.argv[2:])
+PYEOF
+}
+
+# Leer el registry de stacks desde core
+# Devuelve: "id label legacy recommended repo_ssh repo_https dir" por línea
+read_stack_registry() {
+  local registry="$GOVERNANCE_DIR/core/registry/stacks.yml"
+
+  [ -f "$registry" ] || return 1
+
+  python3 - "$registry" << 'PYEOF'
+import sys, re
+
+def parse_registry(path):
+    with open(path) as f:
+        lines = f.readlines()
+
+    stacks = {}
+    current_stack = None
+    in_repo = False
+
+    for line in lines:
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith('#'):
+            continue
+        indent = len(stripped) - len(stripped.lstrip())
+
+        m = re.match(r'\s*(\S[^:]*?):\s*(.*)', stripped)
+        if not m:
+            continue
+        key, value = m.group(1).strip(), m.group(2).strip().strip('"\'\' ')
+
+        if indent == 2 and not value:  # stack id
+            current_stack = key
+            stacks[key] = {'id': key, 'label': key, 'legacy': 'false',
+                          'recommended': 'true', 'ssh': '', 'https': '', 'dir': key}
+            in_repo = False
+        elif current_stack and indent == 4:
+            if key == 'repo':
+                in_repo = True
+            elif key in ('label', 'legacy', 'recommended', 'eol', 'dir'):
+                stacks[current_stack][key] = value
+                in_repo = False
+        elif current_stack and indent == 6 and in_repo:
+            if key == 'ssh':
+                stacks[current_stack]['ssh'] = value
+            elif key == 'https':
+                stacks[current_stack]['https'] = value
+
+    for sid, s in stacks.items():
+        print(f"{s['id']}|{s['label']}|{s.get('legacy','false')}|{s.get('recommended','true')}|{s.get('ssh','')}|{s.get('https','')}|{s.get('dir', sid)}")
+
+parse_registry(sys.argv[1])
+PYEOF
+}
+
+determine_protocol() {
+  if check_ssh_access; then
+    log_ok "Acceso SSH a Bitbucket disponible"
+    PROTOCOL="ssh"
+    CORE_REPO="$DEFAULT_CORE_REPO_SSH"
+    PRESTASHOP_REPO="$DEFAULT_PRESTASHOP_REPO_SSH"
+    MAGENTO_REPO="$DEFAULT_MAGENTO_REPO_SSH"
+    return 0
+  else
+    log_warn "SSH no disponible, usando HTTPS (necesitarás credenciales)"
+    PROTOCOL="https"
+    CORE_REPO="$DEFAULT_CORE_REPO_HTTPS"
+    PRESTASHOP_REPO="$DEFAULT_PRESTASHOP_REPO_HTTPS"
+    MAGENTO_REPO="$DEFAULT_MAGENTO_REPO_HTTPS"
+    return 0
+  fi
+}
+
+# Configurar gitignore global automáticamente
+setup_gitignore_global() {
+  local changed=false
+  
+  # Crear archivo si no existe
+  touch "$GITIGNORE_GLOBAL"
+  
+  # Añadir entradas si no existen
+  if ! grep -qxF '.cursor/' "$GITIGNORE_GLOBAL" 2>/dev/null; then
+    echo '.cursor/' >> "$GITIGNORE_GLOBAL"
+    changed=true
+  fi
+  
+  if ! grep -qxF '.iagt-governance.yml.generated' "$GITIGNORE_GLOBAL" 2>/dev/null; then
+    echo '.iagt-governance.yml.generated' >> "$GITIGNORE_GLOBAL"
+    changed=true
+  fi
+  
+  # Configurar git para usar este archivo
+  local current_excludes
+  current_excludes=$(git config --global core.excludesfile 2>/dev/null || true)
+  
+  if [ "$current_excludes" != "$GITIGNORE_GLOBAL" ]; then
+    git config --global core.excludesfile "$GITIGNORE_GLOBAL"
+    changed=true
+  fi
+  
+  if [ "$changed" = true ]; then
+    log_ok "Gitignore global configurado: $GITIGNORE_GLOBAL"
+  fi
+}
+
+# Check si Cursor está instalado
+check_cursor_installed() {
+  if command -v cursor >/dev/null 2>&1; then
+    return 0
+  fi
+  # Alternativa: buscar en ubicaciones comunes
+  if [ -d "/Applications/Cursor.app" ] || [ -f "$HOME/.local/bin/cursor" ]; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_iagt_home() {
+  if [ ! -d "$IAGT_HOME" ]; then
+    mkdir -p "$IAGT_HOME"
+    log_info "Creado directorio: $IAGT_HOME"
+  fi
+}
+
+# Detectar stack (desde pin o heurística)
+detect_stack() {
+  # 1. Desde pin file (preferido)
+  if [ -f "$PIN_FILE" ]; then
+    local stack
+    stack=$(grep "^stack:" "$PIN_FILE" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+    if [ -n "$stack" ]; then
+      echo "$stack"
+      return 0
+    fi
+  fi
+  
+  # 2. Heurística
+  if detect_stack_by_structure; then
+    return 0
+  fi
+  
+  return 1
+}
+
+get_stack_dir() {
+  local stack="$1"
+  echo "$GOVERNANCE_DIR/$stack"
+}
+
+# ============================================================
+# STACK DISCOVERY AND LAYER RESOLUTION (centralized)
+# ============================================================
+# All commands should use these helpers so stack and layer logic
+# stays in one place. Active stack resolution: pin first, then
+# structure. Layer discovery uses a deterministic order; legacy
+# subagents/ is supported when agents/ is absent.
+
+# Resolve active stack: pin first (get_stack_from_pin), fallback detect_stack_by_structure.
+resolve_active_stack() {
+  detect_stack
+}
+
+# Return stack root directory: ~/.iagt/governance/<stack>
+get_stack_root() {
+  local stack="$1"
+  get_stack_dir "$stack"
+}
+
+# Return path to layer directory if it exists, else empty.
+# For layer "agents": prefer agents/, fallback subagents/ (legacy).
+get_stack_layer_dir() {
+  local stack="$1"
+  local layer="$2"
+  local root
+  root=$(get_stack_root "$stack")
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    echo ""
+    return
+  fi
+  if [ "$layer" = "agents" ]; then
+    [ -d "$root/agents" ] && echo "$root/agents" && return
+    [ -d "$root/subagents" ] && echo "$root/subagents" && return
+    echo ""
+    return
+  fi
+  [ -d "$root/$layer" ] && echo "$root/$layer" || echo ""
+}
+
+# Return success if the given layer exists (agents or subagents counts as "agents").
+stack_has_layer() {
+  local stack="$1"
+  local layer="$2"
+  local dir
+  dir=$(get_stack_layer_dir "$stack" "$layer")
+  [ -n "$dir" ]
+}
+
+# List available layer names in deterministic order: agents, skills, commands, checklists, lessons, tests.
+# Legacy: if agents/ does not exist but subagents/ exists, list "agents".
+list_stack_layers() {
+  local stack="$1"
+  local root
+  root=$(get_stack_root "$stack")
+  [ -z "$root" ] || [ ! -d "$root" ] && return
+  for layer in agents skills commands checklists lessons tests; do
+    if [ "$layer" = "agents" ]; then
+      [ -d "$root/agents" ] || [ -d "$root/subagents" ] && echo "agents"
+    else
+      [ -d "$root/$layer" ] && echo "$layer"
+    fi
+  done
+}
+
+# Returns path to tests/unit if it exists, else empty.
+get_stack_tests_dir() {
+  local stack="$1"
+  local root
+  root=$(get_stack_root "$stack")
+  [ -d "$root/tests/unit" ] && echo "$root/tests/unit"
+}
+
+# Generar .cursorignore base si no existe en el proyecto actual
+setup_cursorignore() {
+  local stack="${1:-}"
+  local cursorignore=".cursorignore"
+
+  # Solo actuar si no existe — nunca sobreescribir
+  if [ -f "$cursorignore" ]; then
+    return 0
+  fi
+
+  # Bloque base común a todos los stacks
+  cat > "$cursorignore" << 'CURSORIGNORE'
+# Dependencias
+vendor/
+node_modules/
+
+# Cache y generados
+var/cache/
+var/logs/
+app/cache/
+app/logs/
+
+# Configuración sensible
+app/config/parameters.php
+app/config/parameters.yml
+*.env.local
+*.env.*.local
+
+# IDE
+.idea/
+.vscode/
+
+# Git
+.git/
+
+# Governance generado (no excluir .cursor/rules/)
+.iagt-governance.yml.generated
+
+# Planes de sesión — no indexar automáticamente (usa @.cursor/plans/nombre.md para referenciar)
+.cursor/plans/
+CURSORIGNORE
+
+  # Bloques específicos por stack
+  case "$stack" in
+    prestashop)
+      cat >> "$cursorignore" << 'CURSORIGNORE_PS'
+
+# PrestaShop
+themes/*/assets/cache/
+themes/*/assets/js/
+themes/*/assets/css/
+img/
+mails/
+upload/
+download/
+CURSORIGNORE_PS
+      ;;
+    magento)
+      cat >> "$cursorignore" << 'CURSORIGNORE_MG'
+
+# Magento
+generated/
+pub/static/
+var/view_preprocessed/
+CURSORIGNORE_MG
+      ;;
+  esac
+
+  log_ok ".cursorignore generado (base para stack: ${stack:-genérico})"
+  log_info "Revisa .cursorignore y ajusta según el proyecto antes de commitear"
+}
+
+# Generar .cursorindexignore — ficheros excluidos del índice automático
+# pero referenciables manualmente con @
+# Distinción clave vs .cursorignore:
+#   .cursorignore      → nunca en contexto (vendor/, caches, secrets)
+#   .cursorindexignore → no carga automática, pero disponible con @fichero
+setup_cursorindexignore() {
+  local stack="${1:-}"
+  local indexignore=".cursorindexignore"
+
+  [ -f "$indexignore" ] && return 0
+
+  cat > "$indexignore" << 'INDEXIGNORE'
+# Documentación de referencia — no cargar automáticamente
+# Usar @security-reference cuando necesites los ejemplos completos
+security/prestashop-security-reference.md
+
+# Changelogs y versioning — disponibles con @ pero no en contexto por defecto
+CHANGELOG.md
+governance.version
+
+# Lessons y patrones aprendidos — referenciar con @ cuando sea relevante
+lessons/
+lessons/learned-patterns.md
+
+# Documentación de arquitectura extensa — cargar solo cuando se trabaje en arquitectura
+architecture/prestashop-legacy-architecture.md
+
+# Tests y fixtures — disponibles con @ pero no añaden valor en contexto general
+tests/
+INDEXIGNORE
+
+  # Bloques específicos por stack
+  case "$stack" in
+    prestashop)
+      cat >> "$indexignore" << 'INDEXIGNORE_PS'
+
+# PrestaShop — docs de referencia cargables bajo demanda
+patterns/prestashop-enterprise-hardened-v2.0.md
+standards/prestashop-development-standards.md
+INDEXIGNORE_PS
+      ;;
+  esac
+
+  log_ok ".cursorindexignore generado — docs de referencia excluidos del índice automático"
+  log_info "  Usa @fichero para cargarlos manualmente cuando sean relevantes"
+}
+
+# Crear .cursor/plans/ para planificación versionada
+# Los planes guardados aquí persisten entre sesiones y documentan el trabajo del equipo
+# Referencia: cursor.com/blog/agent-best-practices — "Save to workspace" → .cursor/plans/
+setup_cursor_plans() {
+  local plans_dir=".cursor/plans"
+  mkdir -p "$plans_dir"
+
+  # README si no existe
+  if [ ! -f "$plans_dir/README.md" ]; then
+    cat > "$plans_dir/README.md" << 'PLANSEOF'
+# Plans
+
+Planes de implementación guardados desde Cursor (Plan Mode → "Save to workspace").
+
+## Cómo usar
+
+Desde Cursor: activa Plan Mode (Shift+Tab), genera el plan, haz clic en "Save to workspace".
+El plan se guarda aquí como `<feature>.md` y persiste entre sesiones.
+
+Para referenciar un plan en el chat:
+```
+@.cursor/plans/iagt-counteroffer-refactor.md Continúa implementando desde donde lo dejé
+```
+
+## Convención de nombres
+
+`<módulo>-<feature>.md` — ejemplo: `iagt-counteroffer-multishop.md`
+
+## Nota
+
+Los planes no se indexan automáticamente (.cursorignore).
+Referenciarlos explícitamente con @ cuando sean relevantes.
+PLANSEOF
+    log_ok ".cursor/plans/ creado (planificación versionada entre sesiones)"
+  fi
+}
+
+# Copiar skills pre-construidas (con SKILL.md propio, no generadas desde .yml)
+# Usado para skills SDD y otras que ya vienen empaquetadas
+setup_cursor_skills_prebuilt() {
+  local stack="${1:-}"
+  local stack_dir
+  stack_dir=$(get_stack_root "$stack" 2>/dev/null || echo "")
+  local prebuilt_dir="${stack_dir}/skills-prebuilt"
+  [ -d "$prebuilt_dir" ] || return 0
+
+  local skills_base=".cursor/skills"
+  mkdir -p "$skills_base"
+
+  local copied=0
+  for src_dir in "$prebuilt_dir"/*/; do
+    [ -d "$src_dir" ] || continue
+    local skill_name
+    skill_name=$(basename "$src_dir")
+    local dst_dir="$skills_base/$skill_name"
+
+    # Solo copiar si no existe o si la fuente es más reciente
+    if [ ! -d "$dst_dir" ] || [ "$src_dir/SKILL.md" -nt "$dst_dir/SKILL.md" ] 2>/dev/null; then
+      cp -r "$src_dir" "$dst_dir"
+      ((copied++)) || true
+    fi
+  done
+
+  [ "$copied" -gt 0 ] && log_ok "$copied skill(s) pre-construidas copiadas en $skills_base"
+  return 0
+}
+
+# Copiar subagents al proyecto (.cursor/agents/)
+# Formato Cursor 2.4: archivos .md con YAML frontmatter
+setup_cursor_agents() {
+  local stack="${1:-}"
+  local stack_dir
+  stack_dir=$(get_stack_root "$stack" 2>/dev/null || echo "")
+  local agents_src="${stack_dir}/agents"
+  [ -d "$agents_src" ] || return 0
+
+  local agents_dst=".cursor/agents"
+  mkdir -p "$agents_dst"
+
+  local copied=0
+  for src in "$agents_src"/*.md; do
+    [ -f "$src" ] || continue
+    local name
+    name=$(basename "$src")
+    # Excluir README.md y archivos sin frontmatter name:
+    [ "$name" = "README.md" ] && continue
+    grep -q "^name:" "$src" 2>/dev/null || continue
+    local dst="$agents_dst/$name"
+    if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ]; then
+      cp "$src" "$dst"
+      ((copied++)) || true
+    fi
+  done
+
+  [ "$copied" -gt 0 ] && log_ok "$copied subagent(s) copiados en $agents_dst"
+  return 0
+}
+
+# Sincronizar commands del catálogo a .cursor/commands/
+# Cursor los descubre automáticamente y los invoca con /nombre
+setup_cursor_commands() {
+  local stack="${1:-}"
+  local stack_dir
+  stack_dir=$(get_stack_root "$stack" 2>/dev/null || echo "")
+  [ -z "$stack_dir" ] || [ ! -d "$stack_dir/commands" ] && return 0
+
+  local commands_dir=".cursor/commands"
+  mkdir -p "$commands_dir"
+
+  local copied=0
+  for src in "$stack_dir/commands/"*.md; do
+    [ -f "$src" ] || continue
+    local name
+    name=$(basename "$src")
+    [ "$name" = "README.md" ] && continue
+    local dst="$commands_dir/$name"
+    # Solo copiar si no existe o si la fuente es más reciente
+    if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ]; then
+      cp "$src" "$dst"
+      ((copied++)) || true
+    fi
+  done
+
+  [ "$copied" -gt 0 ] && log_ok "$copied command(s) sincronizados en $commands_dir"
+  return 0
+}
+
+# Generar SKILL.md wrappers en .cursor/skills/ para carga dinámica por Cursor
+# Cursor lee el nombre+descripción y carga el contenido solo cuando es relevante
+setup_cursor_skills() {
+  local stack="${1:-}"
+  local stack_dir
+  stack_dir=$(get_stack_root "$stack" 2>/dev/null || echo "")
+  [ -z "$stack_dir" ] || [ ! -d "$stack_dir/skills" ] && return 0
+
+  local skills_base=".cursor/skills"
+  mkdir -p "$skills_base"
+
+  local generated=0
+  for src in "$stack_dir/skills/"*.yml; do
+    [ -f "$src" ] || continue
+    local yml_name
+    yml_name=$(basename "$src" .yml)
+
+    # Extraer campos del yml
+    local skill_purpose skill_domain
+    skill_purpose=$(grep -A2 "^purpose:" "$src" 2>/dev/null | tr -d '\n' | sed "s/purpose:[[:space:]]*//" | sed "s/>[[:space:]]*//" | tr -s ' ' | cut -c1-120 || echo "")
+    [ -z "$skill_purpose" ] && skill_purpose=$(grep -m1 "^description:" "$src" 2>/dev/null | sed "s/^description:[[:space:]]*//" | tr -d '"' || echo "")
+    skill_domain=$(grep -m1 "^domain:" "$src" 2>/dev/null | sed "s/^domain:[[:space:]]*//" | tr -d '"' || echo "code")
+
+    # Trigger description en formato oficial Cursor: name + description
+    local trigger_description
+    case "$yml_name" in
+      ai-review|security-audit|multishop-audit|service-layer-audit)
+        # Estas skills están en skills-prebuilt/ con contenido completo
+        # El .yml ya no genera wrappers — skip silencioso
+        continue
+        ;;
+      lesson-review)
+        trigger_description="IAGT governance lesson review. Use when analyzing incidents, reviewing exceptions, or improving governance artifacts."
+        ;;
+      *)
+        trigger_description="${skill_purpose:-IAGT ${skill_domain} skill for PrestaShop}. Use when working on ${skill_domain} in a PrestaShop IAGT project."
+        ;;
+    esac
+
+    local skill_dir="$skills_base/$yml_name"
+    local skill_file="$skill_dir/SKILL.md"
+    mkdir -p "$skill_dir"
+
+    # Generar SKILL.md solo si no existe (no sobreescribir personalizaciones)
+    if [ ! -f "$skill_file" ]; then
+      {
+        # Formato oficial Cursor: name + description son los campos obligatorios
+        echo "---"
+        echo "name: ${yml_name}"
+        echo "description: ${trigger_description}"
+        echo "---"
+        echo ""
+        echo "# ${yml_name}"
+        echo ""
+        echo "## When to use"
+        echo ""
+        echo "${skill_purpose}"
+        echo ""
+        echo "## Governance documents to load"
+        echo ""
+        if grep -q "canonical:" "$src" 2>/dev/null; then
+          grep -A20 "canonical:" "$src" | grep "\.md" | while IFS= read -r line; do val=$(echo "$line" | sed 's/.*: //' | tr -d '"'); echo "- @${stack_dir}/${val}"; done
+        fi
+        echo ""
+        echo "## Checklists"
+        echo ""
+        if grep -q "uses_checklists:" "$src" 2>/dev/null; then
+          grep -A10 "uses_checklists:" "$src" | grep "checklists/" | sed "s/.*- /- /" | tr -d '"'
+        fi
+        echo ""
+        echo "## Output format"
+        echo ""
+        echo "Use severity indicators: 🔴 blocking · 🟡 warning · 🟢 correct · 💡 suggestion"
+        echo "Always reference the specific governance rule violated."
+        echo "Respond in Spanish."
+      } > "$skill_file"
+      ((generated++)) || true
+    fi
+  done
+
+  [ "$generated" -gt 0 ] && log_ok "$generated skill(s) generados en $skills_base"
+  return 0
+}
+
+# Generar governance-modules.mdc — lee del manifest del stack
+generate_modules_rule() {
+  local stack="$1"
+  local stack_dir="$2"
+
+  # Leer del manifest
+  local globs desc arch_file
+  globs=$(read_manifest_field "$stack_dir" "cli.modules.globs" 2>/dev/null)
+  desc=$(read_manifest_field "$stack_dir" "cli.modules.description" 2>/dev/null)
+  arch_file_rel=$(read_manifest_field "$stack_dir" "cli.modules.file" 2>/dev/null)
+
+  # Fallback si el manifest no tiene la sección cli.modules
+  if [ -z "$globs" ]; then
+    globs="**/*"
+    desc="IAGT ${stack} architecture and naming conventions"
+  fi
+
+  local arch_file=""
+  [ -n "$arch_file_rel" ] && arch_file="$stack_dir/$arch_file_rel"
+
+  # Archivos adicionales del manifest (cli.modules.additional)
+  # Fallback: convenciones estándar
+  local conv_file="$stack_dir/conventions/coding-conventions.md"
+  local ctx_file="$stack_dir/context/${stack}-iagt-context.md"
+  local std_file="$stack_dir/standards/${stack}-development-standards.md"
+
+  [ -f "$arch_file" ] || [ -f "$conv_file" ] || return 0
+
+  {
+    echo "---"
+    echo "description: ${desc}"
+    echo "globs: \"${globs}\""
+    echo "alwaysApply: false"
+    echo "---"
+    echo ""
+    [ -n "$arch_file" ] && [ -f "$arch_file" ] && echo "@$arch_file" && echo ""
+    [ -f "$conv_file" ] && echo "@$conv_file" && echo ""
+    [ -f "$ctx_file"  ] && echo "@$ctx_file"  && echo ""
+    [ -f "$std_file"  ] && echo "For development standards: @$std_file" && echo ""
+  } > "$GOV_MODULES_RULE"
+  log_ok "Modules rule generada: $GOV_MODULES_RULE (globs: ${globs})"
+}
+
+# Generar AGENTS.md en la raíz del proyecto
+# Estándar abierto compatible con Cursor, Codex, Gemini, Copilot y otros agentes
+generate_agents_md() {
+  local stack="$1"
+  local stack_dir="$2"
+  local agents_file="AGENTS.md"
+
+  [ -f "$agents_file" ] && return 0
+
+  local stack_version=""
+  if [ -f ".iagt-governance.yml" ]; then
+    stack_version=$(grep "^stack_version:" ".iagt-governance.yml" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "")
+  fi
+
+  # Usar template del catálogo si existe
+  local template_file="$stack_dir/templates/agents-md-template.md"
+  if [ -f "$template_file" ]; then
+    sed "s/{{STACK_VERSION}}/$stack_version/g; s/{{STACK}}/$stack/g" "$template_file" > "$agents_file"
+    log_ok "AGENTS.md generado desde template: $agents_file"
+    return 0
+  fi
+
+  # Generar inline si no hay template
+  {
+    echo "# AGENTS.md — IAGT ${stack^} Project"
+    echo ""
+    echo "Stack: IAGT PrestaShop 8.x Legacy${stack_version:+ ($stack_version)}"
+    echo ""
+    echo "## Architecture constraints"
+    echo ""
+    echo "- No namespaces, no Composer autoload, no Symfony DI"
+    echo "- Service Layer mandatory — business logic ONLY in classes/Iagt*Service.php"
+    echo "- All custom classes use \`Iagt\` prefix"
+    echo "- Multishop always — every query must filter by \`id_shop\`"
+    echo "- Overrides prohibited — use hooks; exceptions require documentation"
+    echo ""
+    echo "## Safety — always ask before"
+    echo ""
+    echo "- git push, git commit, any destructive git operation"
+    echo "- Modifying core PrestaShop files (classes/, controllers/)"
+    echo "- Running composer install/update"
+    echo "- Executing SQL directly on any environment"
+    echo "- Deleting files or directories"
+    echo ""
+    echo "## Governance commands (run before PR)"
+    echo ""
+    echo "\`\`\`"
+    echo "/review               → always"
+    echo "/security-check       → if you touched SQL, inputs, uploads, or APIs"
+    echo "/multishop-check      → if you touched queries with persistent data"
+    echo "/servicelayer-review  → if you added or changed business logic"
+    echo "\`\`\`"
+    echo ""
+    echo "## Plan Mode"
+    echo ""
+    echo "For features touching multiple layers: activate Plan Mode (Shift+Tab)."
+    echo "Verify the plan routes logic to Service Layer before approving."
+    echo ""
+    echo "## Recommended models"
+    echo ""
+    echo "| Task | Model |"
+    echo "|------|-------|"
+    echo "| Daily implementation | Composer 2 Fast |"
+    echo "| Architecture proposal (/iagt-sdd:new) | claude-sonnet-4-6 |"
+    echo "| Spec + verify (/iagt-sdd:continue) | claude-sonnet-4-6 |"
+    echo "| Subagent auditors | Composer 2 Fast |"
+    echo "| Complex/critical features | claude-opus-4-6 |"
+    echo ""
+    echo "Rule: Composer 2 Fast to execute. Claude Sonnet to decide."
+    echo ""
+    echo "## Verification"
+    echo ""
+    echo "\`\`\`bash"
+    echo "iagt-governance doctor"
+    echo "iagt-governance validate"
+    echo "\`\`\`"
+  } > "$agents_file"
+
+  log_ok "AGENTS.md generado: $agents_file"
+}
+
+# Generar .cursor/hooks.json con hooks de governance
+# - beforeShellExecution: bloquea/filtra comandos peligrosos
+# - afterFileEdit: detecta patrones de seguridad en PHP editado
+# - stop: ejecuta iagt-governance validate al terminar la sesión
+setup_cursor_hooks() {
+  local hooks_file=".cursor/hooks.json"
+  local hooks_dir=".cursor/hooks"
+
+  # No sobreescribir si ya existe personalizado
+  if [ -f "$hooks_file" ]; then
+    return 0
+  fi
+
+  mkdir -p "$hooks_dir"
+
+  # ── Hook 1: shell guard ─────────────────────────────────────────────────
+  # Bloquea comandos destructivos antes de ejecutarse
+  cat > "$hooks_dir/governance-shell-guard.sh" << 'HOOKEOF'
+#!/bin/bash
+# governance-shell-guard.sh
+# Intercepta comandos shell del agente antes de ejecutarlos.
+# Bloquea los destructivos, pide confirmación en los peligrosos.
+# Formato entrada (stdin): JSON con campo "command"
+# Formato salida (stdout): JSON con continue, permission, userMessage, agentMessage
+
+set -euo pipefail
+
+# Leer payload completo de stdin
+payload=$(cat)
+cmd=$(echo "$payload" | grep -o '"command":"[^"]*"' | sed 's/"command":"//;s/"//')
+
+deny() {
+  local msg="$1"
+  printf '{"continue":false,"permission":"deny","userMessage":"%s","agentMessage":"Command blocked by IAGT governance shell guard: %s"}\n' \
+    "$msg" "$msg"
+  exit 0
+}
+
+ask() {
+  local msg="$1"
+  printf '{"continue":true,"permission":"ask","userMessage":"%s"}\n' "$msg"
+  exit 0
+}
+
+allow() {
+  printf '{"continue":true,"permission":"allow"}\n'
+  exit 0
+}
+
+# ── BLOQUEOS ABSOLUTOS ─────────────────────────────────────────────────────
+
+# git push --force en cualquier forma
+echo "$cmd" | grep -qE "git\s+push\s+.*(-f|--force)" && \
+  deny "git push --force blocked. Force push requires manual execution."
+
+# rm -rf sobre directorios raíz o críticos
+echo "$cmd" | grep -qE "rm\s+-[rf]+\s+(/|./|classes/|controllers/|modules/)" && \
+  deny "rm -rf on critical directory blocked."
+
+# Modificar archivos core de PrestaShop
+echo "$cmd" | grep -qE "(cp|mv|sed|patch|echo).*(classes/|controllers/|init\.php|config\.php)" && \
+  deny "Modification of PrestaShop core files blocked."
+
+# DROP TABLE / TRUNCATE sin prefijo iagt_
+echo "$cmd" | grep -qEi "(DROP\s+TABLE|TRUNCATE)\s+\`?ps_(?!iagt)" && \
+  deny "DROP/TRUNCATE on non-IAGT table blocked."
+
+# ── CONFIRMACIÓN OBLIGATORIA ──────────────────────────────────────────────
+
+# git push (sin force)
+echo "$cmd" | grep -qE "^git\s+push\b" && \
+  ask "⚠️  git push requires manual confirmation. Run it yourself after review."
+
+# git commit
+echo "$cmd" | grep -qE "^git\s+commit\b" && \
+  ask "⚠️  git commit: verify /review output is clean before committing."
+
+# composer install/update/require
+echo "$cmd" | grep -qE "composer\s+(install|update|require|remove)\b" && \
+  ask "⚠️  Composer operation requires confirmation. Check impact on dependencies."
+
+# mysql / psql / doctrine:schema
+echo "$cmd" | grep -qE "(mysql|psql|doctrine:schema|db:migrate)\b" && \
+  ask "⚠️  Direct database operation requires manual confirmation."
+
+# chmod +x en archivos desconocidos
+echo "$cmd" | grep -qE "chmod\s+(\+x|777|755)\b" && \
+  ask "⚠️  chmod on file requires confirmation."
+
+# ── PERMITIR TODO LO DEMÁS ────────────────────────────────────────────────
+allow
+HOOKEOF
+  chmod +x "$hooks_dir/governance-shell-guard.sh"
+
+  # ── Hook 2: PHP security scanner (afterFileEdit) ────────────────────────
+  # Detecta patrones de seguridad en PHP recién editado y añade aviso al agente
+  cat > "$hooks_dir/governance-php-scan.sh" << 'HOOKEOF'
+#!/bin/bash
+# governance-php-scan.sh
+# Detecta patrones de seguridad críticos en archivos PHP editados.
+# Informativo — no bloquea, añade contexto al agente.
+
+payload=$(cat)
+file_path=$(echo "$payload" | grep -o '"file_path":"[^"]*"' | sed 's/"file_path":"//;s/"//')
+
+# Solo actuar en archivos PHP
+echo "$file_path" | grep -qE "\.php$" || exit 0
+[ -f "$file_path" ] || exit 0
+
+findings=""
+
+# Rule 1: raw superglobals
+grep -nE "\\\$_(GET|POST|REQUEST|COOKIE|FILES)\[" "$file_path" 2>/dev/null | \
+  head -3 | while read -r line; do
+    findings="$findings R1:raw-input($line);"
+  done
+
+# Rule 2: SQL sin cast
+grep -nE "\"(SELECT|INSERT|UPDATE|DELETE).*\\\$[^)\"']" "$file_path" 2>/dev/null | \
+  grep -vE "\(int\)|\(float\)|pSQL\(" | head -3 | while read -r line; do
+    findings="$findings R2:sql-injection($line);"
+  done
+
+# Rule 3: echo/die con excepción
+grep -nE "(echo|die)\s*\\\$e(->getMessage)?\(\)" "$file_path" 2>/dev/null | \
+  head -2 | while read -r line; do
+    findings="$findings R3:exposed-error($line);"
+  done
+
+# Solo loguear — no modifica flujo del agente
+[ -n "$findings" ] && \
+  echo "[governance-php-scan] $file_path: $findings" >> ".cursor/hooks/scan.log" 2>/dev/null
+
+exit 0
+HOOKEOF
+  chmod +x "$hooks_dir/governance-php-scan.sh"
+
+  # ── Hook 3: stop → validate ─────────────────────────────────────────────
+  cat > "$hooks_dir/governance-stop.sh" << 'HOOKEOF'
+#!/bin/bash
+# governance-stop.sh — ejecuta validación al terminar la sesión del agente
+read -r payload
+status=$(echo "$payload" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+[ "$status" != "completed" ] && exit 0
+command -v iagt-governance >/dev/null 2>&1 && \
+  iagt-governance validate --quiet 2>/dev/null || true
+echo '{}'
+HOOKEOF
+  chmod +x "$hooks_dir/governance-stop.sh"
+
+  # ── Hook 4: secrets redactor (beforeReadFile) ───────────────────────────
+  # Redacta credenciales y secretos ANTES de que lleguen al LLM
+  # Actúa sobre: parameters.php, .env*, config*.php, cualquier archivo con patrones sensibles
+  cat > "$hooks_dir/governance-secrets-redact.sh" << 'HOOKEOF'
+#!/bin/bash
+# governance-secrets-redact.sh
+# Intercepta lectura de archivos antes de enviarlos al LLM.
+# Redacta credenciales, API keys, passwords y tokens.
+# Formato entrada (stdin): JSON con file_path y content
+# Formato salida (stdout): JSON con content redactado (o vacío para pasar sin cambios)
+
+set -euo pipefail
+
+payload=$(cat)
+file_path=$(echo "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('file_path',''))" 2>/dev/null || echo "")
+content=$(echo "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('content',''))" 2>/dev/null || echo "")
+
+# Archivos que siempre se redactan completamente
+case "$file_path" in
+  */parameters.php|*/parameters.yml|*/.env|*/.env.*|*/config/local.php)
+    python3 -c "
+import json, sys
+content = '''$content'''
+# Redactar líneas con credenciales
+lines = content.split('\n')
+redacted = []
+sensitive = ['password','passwd','secret','key','token','api_key','database_password',
+             'mailer_password','database_host','database_name','database_user']
+for line in lines:
+    low = line.lower()
+    if any(s in low for s in sensitive) and ('=' in line or '=>' in line or ':' in line):
+        # Mantener el nombre de la variable, redactar el valor
+        if '=>' in line:
+            parts = line.split('=>', 1)
+            redacted.append(parts[0] + '=> \"[REDACTED by governance-secrets-redact]\",')
+        elif '=' in line:
+            parts = line.split('=', 1)
+            redacted.append(parts[0] + '= \"[REDACTED]\";')
+        else:
+            redacted.append('[REDACTED LINE]')
+    else:
+        redacted.append(line)
+result = '\n'.join(redacted)
+print(json.dumps({'content': result}))
+" 2>/dev/null || echo '{}'
+    exit 0
+    ;;
+esac
+
+# Para cualquier otro archivo: redactar patrones sensibles inline
+# Solo actuar si el archivo contiene patrones de secretos
+if echo "$content" | grep -qEi \
+  "(password|api_key|api_secret|secret_key|access_token|bearer\s+[A-Za-z0-9]|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)"; then
+  python3 -c "
+import json, re, sys
+
+content = '''$(echo "$content" | sed "s/'/'\\\\''/g")'''
+
+# Patrones de redacción
+patterns = [
+    # Bearer tokens
+    (r'(Bearer\s+)[A-Za-z0-9\-._~+/]+=*', r'\1[REDACTED]'),
+    # API keys formato common (32+ chars alfanumeric)
+    (r'(api[_\-]?(?:key|secret|token)\s*[=:]\s*[\"\'`]?)[A-Za-z0-9+/]{32,}([\"\'`]?)', r'\1[REDACTED]\2'),
+    # Private keys PEM
+    (r'-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----', '[REDACTED PRIVATE KEY]', ),
+    # Passwords en assignment
+    (r'([Pp]assword\s*[=:]\s*[\"\'`])[^\"\' \t\n]+([\"\'`])', r'\1[REDACTED]\2'),
+]
+
+for p in patterns:
+    flags = re.DOTALL if len(p) > 2 else 0
+    content = re.sub(p[0], p[1], content, flags=re.DOTALL | re.IGNORECASE)
+
+print(json.dumps({'content': content}))
+" 2>/dev/null || echo '{}'
+  exit 0
+fi
+
+# Sin secretos detectados — pasar contenido sin cambios
+echo '{}'
+HOOKEOF
+  chmod +x "$hooks_dir/governance-secrets-redact.sh"
+
+  # ── hooks.json con los cuatro hooks ──────────────────────────────────────
+  cat > "$hooks_file" << 'HOOKSEOF'
+{
+  "version": 1,
+  "hooks": {
+    "beforeReadFile": [
+      {
+        "command": ".cursor/hooks/governance-secrets-redact.sh"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": ".cursor/hooks/governance-shell-guard.sh"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": ".cursor/hooks/governance-php-scan.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": ".cursor/hooks/governance-stop.sh"
+      }
+    ]
+  }
+}
+HOOKSEOF
+
+  log_ok "Hooks de governance generados:"
+  log_info "  beforeReadFile       → governance-secrets-redact.sh (redacta secretos antes del LLM)"
+  log_info "  beforeShellExecution → governance-shell-guard.sh (bloquea comandos peligrosos)"
+  log_info "  afterFileEdit        → governance-php-scan.sh (detecta patrones PHP en tiempo real)"
+  log_info "  stop                 → governance-stop.sh (valida governance al terminar sesión)"
+}
+
+
+# ============================================================
+# GOVERNANCE SKILL RUNNER (metadata-driven)
+# ============================================================
+# Orchestrates agents → skills → checklists and runs a lightweight
+# code scan. Returns findings one per line on stdout for comparison.
+# New skills/checklists/domains work without CLI changes.
+#
+# Usage: FOUND_FINDINGS=$(run_skill_for_test "$STACK_DIR" "$domain" "$test_dir" "$code_file")
+run_skill_for_test() {
+  local stack_dir="$1"
+  local domain="$2"
+  local test_dir="$3"
+  local code_file="$4"
+  local findings=""
+
+  # Resolve agent: agents/ (or legacy subagents/) with name matching domain
+  local agents_dir="$stack_dir/agents"
+  [ ! -d "$agents_dir" ] && agents_dir="$stack_dir/subagents"
+  local agent_file=""
+  if [ -d "$agents_dir" ]; then
+    agent_file=$(find "$agents_dir" -maxdepth 1 -type f \( -name "*${domain}*" -o -name "*.yml" -o -name "*.yaml" \) 2>/dev/null | head -n 1)
+  fi
+
+  # Resolve skill from agent: uses_skills -> skills/<name>.yml
+  local skill_file=""
+  if [ -n "$agent_file" ] && [ -f "$agent_file" ]; then
+    local uses_skills
+    uses_skills=$(awk '
+      /^[[:space:]]*uses_skills[[:space:]]*:/ { in_list=1; next }
+      in_list && /^[[:space:]]*-[[:space:]]/ { gsub(/^[[:space:]]*-[[:space:]]*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }
+      in_list && /^[[:space:]]*[a-zA-Z]/ { exit }
+    ' "$agent_file" 2>/dev/null | head -n 1)
+    if [ -n "$uses_skills" ]; then
+      skill_file="$stack_dir/skills/$uses_skills"
+      [ ! -f "$skill_file" ] && skill_file="$stack_dir/skills/${uses_skills%.yml}.yml"
+    fi
+  fi
+
+  # Resolve checklist from skill: uses_checklists -> checklists/<name>.yml
+  local checklist_file=""
+  if [ -n "$skill_file" ] && [ -f "$skill_file" ]; then
+    local uses_checklists
+    uses_checklists=$(awk '
+      /^[[:space:]]*uses_checklists[[:space:]]*:/ { in_list=1; next }
+      in_list && /^[[:space:]]*-[[:space:]]/ { gsub(/^[[:space:]]*-[[:space:]]*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }
+      in_list && /^[[:space:]]*[a-zA-Z]/ { exit }
+    ' "$skill_file" 2>/dev/null | head -n 1)
+    if [ -n "$uses_checklists" ]; then
+      checklist_file="$stack_dir/checklists/$uses_checklists"
+      [ ! -f "$checklist_file" ] && checklist_file="$stack_dir/checklists/${uses_checklists%.yml}.yml"
+    fi
+  fi
+
+  # Delegate pattern detection to rulesets: rulesets/<stack>/<domain>_patterns.sh
+  # Orchestration stays in CLI; analysis is stack/domain-specific and extensible.
+  if [ -n "$code_file" ] && [ -f "$code_file" ] && [ -n "$CLI_DIR" ]; then
+    local stack_name
+    stack_name=$(basename "$stack_dir" 2>/dev/null)
+    local domain_fn="${domain//-/_}"
+    local RULESET="$CLI_DIR/rulesets/$stack_name/${domain}_patterns.sh"
+    if [ -f "$RULESET" ]; then
+      # shellcheck source=/dev/null
+      source "$RULESET" 2>/dev/null || true
+      local run_fn="run_${domain_fn}_patterns"
+      if type "$run_fn" 2>/dev/null | grep -q function; then
+        findings=$("$run_fn" "$code_file" 2>/dev/null)
+      fi
+    else
+      echo "No ruleset available for domain: $domain" >&2
+    fi
+  fi
+
+  echo "$findings"
+}
+
+get_stack_skills_dir() {
+  get_stack_layer_dir "$1" "skills"
+}
+
+get_stack_checklists_dir() {
+  get_stack_layer_dir "$1" "checklists"
+}
+
+# Prefer agents/, fallback subagents/ (legacy).
+get_stack_agents_dir() {
+  get_stack_layer_dir "$1" "agents"
+}
+
+# Obtener path al manifest del stack (si existe)
+get_stack_manifest() {
+  local stack="$1"
+  local stack_dir
+  stack_dir=$(get_stack_dir "$stack")
+
+  local manifest_file="$stack_dir/manifest/stack-manifest.yml"
+  if [ -f "$manifest_file" ]; then
+    echo "$manifest_file"
+  else
+    echo ""
+  fi
+}
+
+# Obtener la rule principal del stack, priorizando manifest si existe
+# La resolución via manifest es tolerante a indentación, espacios y comentarios,
+# y siempre hace fallback a la lógica legacy si algo falla.
+get_rule_source() {
+  local stack="$1"
+  local stack_dir
+  stack_dir=$(get_stack_dir "$stack")
+
+  # 1) Intentar vía manifest (si existe)
+  local manifest_file
+  manifest_file=$(get_stack_manifest "$stack")
+
+  if [ -n "$manifest_file" ]; then
+    # Extraer documents.canonical.main_rule (ruta relativa dentro del stack)
+    # usando awk para tolerar indentación, espacios y comentarios.
+    local main_rule_rel
+    main_rule_rel=$(
+      awk '
+        /^[[:space:]]*#/ { next }                         # ignorar comentarios
+        /^[[:space:]]*documents:[[:space:]]*$/ { in_docs=1; next }
+        in_docs && /^[[:space:]]*canonical:[[:space:]]*$/ { in_canon=1; next }
+        in_docs && !/^[[:space:]]/ { in_docs=0; in_canon=0 }  # salir al romper indentación
+        in_canon && /^[[:space:]]*main_rule:[[:space:]]*/ {
+          line=$0
+          sub(/^[[:space:]]*main_rule:[[:space:]]*/, "", line)
+          sub(/[[:space:]]*#.*/, "", line)               # quitar comentario al final
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)  # trim
+          print line
+          exit
+        }
+      ' "$manifest_file" 2>/dev/null || true
+    )
+
+    if [ -n "$main_rule_rel" ]; then
+      local candidate="$stack_dir/$main_rule_rel"
+      if [ -f "$candidate" ]; then
+        echo "$candidate"
+        return 0
+      else
+        log_warn "Manifest encontrado para stack '$stack' pero main_rule apunta a ruta inválida: $main_rule_rel (fallback a rules/*-main-rule.md)"
+      fi
+    else
+      log_warn "Manifest encontrado para stack '$stack' pero documents.canonical.main_rule no se pudo resolver (fallback a rules/*-main-rule.md)"
+    fi
+    # Si el manifest existe pero no define bien main_rule, continuamos con el fallback legacy
+  fi
+
+  # 2) Fallback legacy: buscar rules/*-main-rule.md
+  local rule_file
+  rule_file=$(find "$stack_dir/rules" -name "*-main-rule.md" -type f 2>/dev/null | head -n 1)
+
+  if [ -n "$rule_file" ]; then
+    echo "$rule_file"
+    return 0
+  fi
+
+  # 3) Si no hay manifest ni rule legacy, devolvemos vacío
+  echo ""
+}
+
+compute_hash() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo "no-hash"
+  fi
+}
+
+# Verificar que un tag existe en el remoto
+tag_exists_remote() {
+  local repo_dir="$1"
+  local tag="$2"
+  git -C "$repo_dir" ls-remote --tags origin "$tag" 2>/dev/null | grep -q "$tag"
+}
+
+# Verificar que un tag existe localmente
+tag_exists_local() {
+  local repo_dir="$1"
+  local tag="$2"
+  git -C "$repo_dir" tag -l "$tag" 2>/dev/null | grep -qx "$tag"
+}
+
+# Extraer archivo de un tag SIN cambiar estado del repo
+# Esto es crítico: el catálogo debe ser inmutable entre proyectos
+git_show_file() {
+  local repo_dir="$1"
+  local tag="$2"
+  local file_path="$3"
+  
+  git -C "$repo_dir" show "$tag:$file_path" 2>/dev/null
+}
+
+# Verificar que un archivo existe en un tag
+file_exists_in_tag() {
+  local repo_dir="$1"
+  local tag="$2"
+  local file_path="$3"
+  
+  git -C "$repo_dir" show "$tag:$file_path" >/dev/null 2>&1
+}
+
+# Obtener path relativo de la rule source en el repo
+# Lee del manifest si existe; fallback a find y luego a convención
+get_rule_path_in_repo() {
+  local stack="$1"
+  local stack_dir
+  stack_dir=$(get_stack_dir "$stack")
+
+  # 1. Leer del manifest
+  local from_manifest
+  from_manifest=$(read_manifest_field "$stack_dir" "cli.main_rule" 2>/dev/null)
+  if [ -n "$from_manifest" ]; then
+    echo "$from_manifest"
+    return 0
+  fi
+
+  # 2. Fallback: find *-main-rule.md
+  local found
+  found=$(find "$stack_dir/rules" -name "*-main-rule.md" -type f 2>/dev/null | head -n 1)
+  if [ -n "$found" ]; then
+    echo "${found#$stack_dir/}"
+    return 0
+  fi
+
+  # 3. Fallback final: convención
+  echo "rules/${stack}-main-rule.md"
+}
+
+# Detectar stack por estructura del proyecto (sin usar pin)
+detect_stack_by_structure() {
+  # Detecta la FAMILIA de stack (no la variante exacta)
+  # prestashop8, prestashop7 → familia "prestashop"
+  # magento24, magento22     → familia "magento"
+  # nodejs22, nodejs20       → familia "node"
+
+  # PrestaShop
+  if [ -f "config/settings.inc.php" ] || [ -f "app/config/parameters.php" ]; then
+    echo "prestashop"
+    return 0
+  fi
+
+  # Magento
+  if [ -f "bin/magento" ]; then
+    echo "magento"
+    return 0
+  fi
+
+  # Node.js
+  if [ -f "package.json" ]; then
+    echo "node"
+    return 0
+  fi
+
+  # Python
+  if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+    echo "python"
+    return 0
+  fi
+
+  return 1
+}
+
+# Obtener la familia de un stack ID
+# prestashop8 → prestashop, nodejs22 → node, magento24 → magento
+get_stack_family() {
+  local stack_id="$1"
+  case "$stack_id" in
+    prestashop*) echo "prestashop" ;;
+    magento*)    echo "magento" ;;
+    node*)       echo "node" ;;
+    python*)     echo "python" ;;
+    *)           echo "$stack_id" ;;
+  esac
+}
+
+# Validar que el stack del pin coincide con la estructura
+validate_stack_consistency() {
+  local pin_stack="$1"
+  local detected_stack=""
+  
+  if detected_stack=$(detect_stack_by_structure); then
+    # Comparar por familia — prestashop8 y prestashop son la misma familia
+    local pin_family detected_family
+    pin_family=$(get_stack_family "$pin_stack")
+    detected_family=$(get_stack_family "$detected_stack")
+    if [ "$pin_family" != "$detected_family" ]; then
+      log_error "Inconsistencia de stack detectada:"
+      log_error "  Pin dice:        $pin_stack (familia: $pin_family)"
+      log_error "  Estructura dice: $detected_stack (familia: $detected_family)"
+      log_error ""
+      log_error "Si el pin es correcto, elimina los archivos que causan confusión."
+      log_error "Si la estructura es correcta, actualiza el pin."
+      return 1
+    fi
+  fi
+  # Si no se detecta estructura, confiamos en el pin
+  return 0
+}
+
+# Validar formato del pin file
+validate_pin_format() {
+  local pin_file="$1"
+  
+  if [ ! -f "$pin_file" ]; then
+    return 1
+  fi
+  
+  # Campos obligatorios
+  local stack core stack_version
+  stack=$(grep "^stack:" "$pin_file" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  core=$(grep "^core:" "$pin_file" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  stack_version=$(grep "^stack_version:" "$pin_file" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  
+  if [ -z "$stack" ]; then
+    log_error "Pin inválido: falta campo 'stack'"
+    return 1
+  fi
+  
+  if [ -z "$core" ]; then
+    log_error "Pin inválido: falta campo 'core'"
+    return 1
+  fi
+  
+  if [ -z "$stack_version" ]; then
+    log_error "Pin inválido: falta campo 'stack_version'"
+    return 1
+  fi
+  
+  # Validar formato de versiones (deben empezar con v)
+  if [[ ! "$core" =~ ^v[0-9] ]]; then
+    log_error "Pin inválido: 'core' debe ser un tag (ej: v2.1.1)"
+    return 1
+  fi
+  
+  if [[ ! "$stack_version" =~ ^v[0-9] ]]; then
+    log_error "Pin inválido: 'stack_version' debe ser un tag (ej: v2.0.5)"
+    return 1
+  fi
+  
+  return 0
+}
+
+# ============================================================
+# COMANDO: install
+# ============================================================
+
+
+# ============================================================
+# CMD: self-update
+# ============================================================
+
+cmd_self_update() {
+  echo "============================================================"
+  echo "  IAGT Governance CLI — Actualización"
+  echo "============================================================"
+  echo ""
+
+  # Leer config
+  local repo_path="" binary_path=""
+  if [ -f "$CONFIG_FILE" ]; then
+    repo_path=$(grep "^  repo_path:" "$CONFIG_FILE" 2>/dev/null \
+      | sed 's/^  repo_path:[[:space:]]*//' | tr -d "'\"")
+    binary_path=$(grep "^  binary:" "$CONFIG_FILE" 2>/dev/null \
+      | sed 's/^  binary:[[:space:]]*//' | tr -d "'\"")
+  fi
+
+  # Si no hay config o ruta vacía, pedir
+  if [ -z "$repo_path" ] || [ ! -d "$repo_path" ]; then
+    log_warn "No se encontró la ruta del repo del CLI en config.yml"
+    echo ""
+    read -r -p "  Ruta del repo local del CLI (ej: /home/user/iagt-governance-cli): " repo_path
+    echo ""
+  fi
+
+  if [ ! -f "$repo_path/bin/iagt-governance" ]; then
+    log_error "No existe bin/iagt-governance en: $repo_path"
+    log_error "Clona el repo primero y ejecuta ./install.sh"
+    exit 1
+  fi
+
+  [ -z "$binary_path" ] && binary_path="$HOME/.local/bin/iagt-governance"
+
+  # Pull del repo
+  log_info "Actualizando repo del CLI..."
+  if git -C "$repo_path" pull --ff-only 2>/dev/null; then
+    log_ok "Repo actualizado"
+  else
+    log_warn "git pull falló — usando versión actual del repo"
+  fi
+
+  # Copiar binario
+  log_info "Instalando binario en $binary_path..."
+  cp "$repo_path/bin/iagt-governance" "$binary_path"
+  chmod +x "$binary_path"
+
+  echo ""
+  echo "============================================================"
+  echo "  SELF-UPDATE COMPLETADO"
+  echo "============================================================"
+  log_ok "CLI actualizado: $binary_path"
+  log_info "Fuente: $repo_path"
+  echo ""
+  echo "  Si hay nuevos stacks en el registry:"
+  echo "  iagt-governance install"
+  echo ""
+}
+
+cmd_install() {
+  echo "============================================================"
+  echo "  IAGT Governance — Instalación del catálogo local"
+  echo "============================================================"
+  echo ""
+  
+  check_dependencies
+  ensure_iagt_home
+  
+  # Determinar protocolo (SSH o HTTPS)
+  log_info "Verificando acceso a Bitbucket..."
+  determine_protocol
+  
+  mkdir -p "$GOVERNANCE_DIR"
+  
+  # Clonar Core
+  local core_dir="$GOVERNANCE_DIR/core"
+  if [ -d "$core_dir" ]; then
+    log_info "Core ya existe, actualizando..."
+    git -C "$core_dir" fetch --tags 2>/dev/null || true
+    git -C "$core_dir" pull --ff-only 2>/dev/null || true
+  else
+    log_info "Clonando governance-core..."
+    if ! git clone "$CORE_REPO" "$core_dir"; then
+      log_error "No se pudo clonar governance-core"
+      log_error "Verifica tu acceso a Bitbucket"
+      exit 1
+    fi
+  fi
+  log_ok "Core instalado: $core_dir"
+  
+  # ── Selector interactivo de stacks — lee del registry de core ─────
+  local registry_file="$GOVERNANCE_DIR/core/registry/stacks.yml"
+
+  declare -A STACK_SSH STACK_HTTPS STACK_LABEL STACK_DIR STACK_LEGACY
+  local -a STACK_ORDER=()
+
+  if [ -f "$registry_file" ]; then
+    # Leer registry desde core
+    while IFS='|' read -r sid label legacy recommended ssh https dir; do
+      STACK_ORDER+=("$sid")
+      STACK_SSH[$sid]="$ssh"
+      STACK_HTTPS[$sid]="$https"
+      STACK_LABEL[$sid]="$label"
+      STACK_DIR[$sid]="$dir"
+      STACK_LEGACY[$sid]="$legacy"
+    done < <(read_stack_registry)
+  else
+    # Fallback hardcodeado si core no tiene registry aún
+    log_warn "Registry no encontrado en core — usando lista por defecto"
+    STACK_ORDER=("prestashop8" "nodejs22")
+    STACK_SSH[prestashop8]="git@bitbucket.org:iagt-amazing-software/iagt-governance-prestashop8.git"
+    STACK_HTTPS[prestashop8]="https://bitbucket.org/iagt-amazing-software/iagt-governance-prestashop8.git"
+    STACK_LABEL[prestashop8]="PrestaShop 8.x"
+    STACK_DIR[prestashop8]="prestashop8"
+    STACK_SSH[nodejs22]="${DEFAULT_NODEJS_REPO_SSH}"
+    STACK_HTTPS[nodejs22]="${DEFAULT_NODEJS_REPO_HTTPS}"
+    STACK_LABEL[nodejs22]="Node.js 22.x LTS"
+    STACK_DIR[nodejs22]="node"
+  fi
+
+  # Detectar stacks ya instalados
+  local -a already_installed=()
+  for sid in "${STACK_ORDER[@]}"; do
+    local sdir="${STACK_DIR[$sid]:-$sid}"
+    [ -d "$GOVERNANCE_DIR/$sdir" ] && already_installed+=("$sid")
+  done
+
+  echo ""
+  echo "  Stacks disponibles:"
+  echo ""
+  local i=1
+  declare -A STACK_INDEX
+  for sid in "${STACK_ORDER[@]}"; do
+    local marker="" legacy_marker=""
+    for ins in "${already_installed[@]}"; do [ "$ins" = "$sid" ] && marker=" [ya instalado]"; done
+    [ "${STACK_LEGACY[$sid]:-false}" = "true" ] && legacy_marker=" [legacy]"
+    printf "    %d) %s%s%s\n" "$i" "${STACK_LABEL[$sid]}" "$legacy_marker" "$marker"
+    STACK_INDEX[$i]="$sid"
+    ((i++))
+  done
+  echo ""
+  echo "  Introduce los números separados por espacio (ej: 1 3)"
+  echo "  Enter sin selección = actualizar solo los ya instalados"
+  echo ""
+  read -r -p "  Stacks a instalar/actualizar: " selection
+  echo ""
+
+  # Construir lista de stacks a procesar
+  local -a stacks_to_process=()
+  if [ -z "$selection" ]; then
+    stacks_to_process=("${already_installed[@]}")
+    if [ ${#stacks_to_process[@]} -eq 0 ]; then
+      log_warn "No hay stacks instalados. Selecciona al menos uno con su número."
+    fi
+  else
+    for num in $selection; do
+      local st="${STACK_INDEX[$num]:-}"
+      [ -n "$st" ] && stacks_to_process+=("$st")
+    done
+  fi
+
+  # Instalar/actualizar cada stack seleccionado
+  for sid in "${stacks_to_process[@]}"; do
+    local sdir="${STACK_DIR[$sid]:-$sid}"
+    local stack_dir="$GOVERNANCE_DIR/$sdir"
+    local repo_url
+    [ "$PROTOCOL" = "ssh" ] && repo_url="${STACK_SSH[$sid]}" || repo_url="${STACK_HTTPS[$sid]}"
+
+    if [ -d "$stack_dir" ]; then
+      log_info "${STACK_LABEL[$sid]} ya existe, actualizando..."
+      git -C "$stack_dir" fetch --tags 2>/dev/null || true
+      git -C "$stack_dir" pull --ff-only 2>/dev/null || true
+    else
+      log_info "Clonando ${STACK_LABEL[$sid]}..."
+      if ! git clone "$repo_url" "$stack_dir" 2>/dev/null; then
+        log_warn "${STACK_LABEL[$sid]} no disponible — verifica el repo en Bitbucket"
+        continue
+      fi
+    fi
+    log_ok "${STACK_LABEL[$sid]} instalado: $stack_dir"
+  done
+
+    # Configurar gitignore global AUTOMÁTICAMENTE
+  log_info "Configurando gitignore global..."
+  setup_gitignore_global
+  
+  # Crear config.yml
+  # Detectar ruta del repo local del CLI
+  local cli_repo_path=""
+  for _cand in     "/media/inigo/Loki/IAGT IA Repos/iagt-governance-cli"     "$HOME/iagt-governance-cli"     "$HOME/repos/iagt-governance-cli"; do
+    [ -f "$_cand/bin/iagt-governance" ] && cli_repo_path="$_cand" && break
+  done
+  local cli_binary_path
+  cli_binary_path=$(which iagt-governance 2>/dev/null || echo "$HOME/.local/bin/iagt-governance")
+
+  cat > "$CONFIG_FILE" <<EOF
+# IAGT Governance — Configuración global
+# Generado automáticamente por iagt-governance install
+
+repos:
+  core: $CORE_REPO
+
+protocol: $(if [[ "$CORE_REPO" == git@* ]]; then echo "ssh"; else echo "https"; fi)
+
+cli:
+  installed: $(date +%Y-%m-%d)
+  repo_path: ${cli_repo_path}
+  binary: ${cli_binary_path}
+EOF
+  log_ok "Configuración creada: $CONFIG_FILE"
+  
+  # Check Cursor (informativo)
+  echo ""
+  if check_cursor_installed; then
+    log_ok "Cursor detectado"
+  else
+    log_warn "Cursor no detectado. Instálalo desde: https://cursor.sh"
+  fi
+  
+  echo ""
+  echo "============================================================"
+  echo "  INSTALACIÓN COMPLETADA"
+  echo "============================================================"
+  echo ""
+  echo "Catálogo instalado en: $GOVERNANCE_DIR"
+  echo "Gitignore global:      $GITIGNORE_GLOBAL"
+  echo ""
+  echo "Próximo paso:"
+  echo "  cd /tu/proyecto && iagt-governance apply"
+  echo ""
+  echo "Si es proyecto nuevo (ejemplos):"
+  echo "  PrestaShop 8: iagt-governance init --stack prestashop8 --core v2.2.0 --stack-version v2.4.0"
+  echo "  Node.js:      iagt-governance init --stack node --core v2.2.0 --stack-version v1.3.0"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: init
+# ============================================================
+
+cmd_init() {
+  check_project_root "init"
+  echo "============================================================"
+  echo "  IAGT Governance — Inicializar pin en proyecto nuevo"
+  echo "============================================================"
+  echo ""
+  
+  # Verificar catálogo instalado
+  if [ ! -d "$GOVERNANCE_DIR" ]; then
+    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    exit 1
+  fi
+  
+  # Verificar que no existe pin
+  if [ -f "$PIN_FILE" ]; then
+    log_error "$PIN_FILE ya existe"
+    echo ""
+    echo "Si quieres cambiar versiones, usa: iagt-governance bump"
+    exit 1
+  fi
+  
+  # Parsear argumentos
+  local stack=""
+  local core_version=""
+  local stack_version=""
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stack)
+        stack="$2"
+        shift 2
+        ;;
+      --core)
+        core_version="$2"
+        shift 2
+        ;;
+      --stack-version)
+        stack_version="$2"
+        shift 2
+        ;;
+      *)
+        log_error "Argumento desconocido: $1"
+        echo ""
+        echo "Uso: iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
+        exit 1
+        ;;
+    esac
+  done
+  
+  # Validar argumentos obligatorios
+  if [ -z "$stack" ] || [ -z "$core_version" ] || [ -z "$stack_version" ]; then
+    log_error "Faltan argumentos obligatorios"
+    echo ""
+    echo "Uso: iagt-governance init --stack <stack> --core <version> --stack-version <version>"
+    echo ""
+    echo "Ejemplo:"
+    echo "  iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
+    echo ""
+    echo "Stacks disponibles: prestashop, magento, node"
+    exit 1
+  fi
+  
+  # Validar formato de versiones
+  if [[ ! "$core_version" =~ ^v[0-9] ]]; then
+    log_error "core debe ser un tag (ej: v2.1.1)"
+    exit 1
+  fi
+  
+  if [[ ! "$stack_version" =~ ^v[0-9] ]]; then
+    log_error "stack-version debe ser un tag (ej: v2.0.5)"
+    exit 1
+  fi
+  
+  # Verificar que el stack existe en el catálogo
+  local stack_dir="$GOVERNANCE_DIR/$stack"
+  local core_dir="$GOVERNANCE_DIR/core"
+  
+  if [ ! -d "$stack_dir" ]; then
+    log_error "Stack '$stack' no existe en el catálogo"
+    echo ""
+    echo "Stacks instalados:"
+    ls -1 "$GOVERNANCE_DIR" | grep -v config.yml
+    exit 1
+  fi
+  
+  # Fetch y validar tags
+  log_info "Verificando tags..."
+  git -C "$core_dir" fetch --tags 2>/dev/null || true
+  git -C "$stack_dir" fetch --tags 2>/dev/null || true
+  
+  if ! tag_exists_local "$core_dir" "$core_version"; then
+    log_error "Tag '$core_version' no existe en core"
+    echo ""
+    echo "Tags disponibles en core:"
+    git -C "$core_dir" tag -l | tail -10
+    exit 1
+  fi
+  log_ok "Tag '$core_version' existe en core"
+  
+  if ! tag_exists_local "$stack_dir" "$stack_version"; then
+    log_error "Tag '$stack_version' no existe en $stack"
+    echo ""
+    echo "Tags disponibles en $stack:"
+    git -C "$stack_dir" tag -l | tail -10
+    exit 1
+  fi
+  log_ok "Tag '$stack_version' existe en $stack"
+  
+  # Crear pin
+  cat > "$PIN_FILE" <<EOF
+stack: $stack
+core: $core_version
+stack_version: $stack_version
+EOF
+  
+  log_ok "Pin creado: $PIN_FILE"
+  
+  echo ""
+  echo "============================================================"
+  echo "  INIT COMPLETADO"
+  echo "============================================================"
+  echo ""
+  echo "Pin creado:"
+  cat "$PIN_FILE"
+  echo ""
+  echo "Próximos pasos:"
+  echo "  1. iagt-governance apply     # Generar rule"
+  echo "  2. git add $PIN_FILE"
+  echo "  3. git commit -m 'chore: add governance pin'"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: apply
+# ============================================================
+
+# Detecta si el usuario está en un subdirectorio con el pin más arriba
+# Si es así, avisa y sale — no sube automáticamente
+check_project_root() {
+  # Si el pin existe aquí, todo bien
+  [ -f "$PIN_FILE" ] && return 0
+
+  # Si no hay pin, buscar hacia arriba (max 10 niveles)
+  local dir="$PWD"
+  local levels=0
+  while [ "$dir" != "/" ] && [ $levels -lt 10 ]; do
+    dir="$(dirname "$dir")"
+    levels=$((levels + 1))
+    if [ -f "$dir/$PIN_FILE" ]; then
+      echo ""
+      log_error "Estás en un subdirectorio del proyecto."
+      log_error "El pin de governance está en: $dir"
+      echo ""
+      echo "  Ejecuta el comando desde la raíz del proyecto:"
+      echo "  cd "$dir""
+      echo "  iagt-governance ${1:-apply}"
+      echo ""
+      exit 1
+    fi
+  done
+
+  # No hay pin en ningún lado — continuar (modo auto-detección)
+  return 0
+}
+
+cmd_apply() {
+  echo "============================================================"
+  echo "  IAGT Governance — Aplicar rule al proyecto"
+  echo "============================================================"
+  echo ""
+
+  # Verificar que estamos en la raíz del proyecto
+  check_project_root "apply"
+
+  # Verificar catálogo instalado (para modo pin y metadatos ricos)
+  if [ ! -d "$GOVERNANCE_DIR" ]; then
+    log_warn "Catálogo global no instalado aún (~/.iagt/governance)."
+  fi
+  
+  # MODO 1: Sin pin → auto-detección de stack y governance-stack.mdc (MDC format)
+  if [ ! -f "$PIN_FILE" ]; then
+    log_info "No existe $PIN_FILE, se usará auto-detección de stack."
+
+    local auto_stack
+    if ! auto_stack=$(resolve_active_stack); then
+      log_error "No governance stack detected (no se reconoce el tipo de proyecto)."
+      exit 1
+    fi
+
+    log_ok "Stack detectado automáticamente: $auto_stack"
+
+    mkdir -p "$CURSOR_RULES_DIR"
+
+    # Nombre legible para el stack
+    local pretty_stack
+    case "$auto_stack" in
+      prestashop) pretty_stack="PrestaShop" ;;
+      magento) pretty_stack="Magento" ;;
+      node) pretty_stack="Node.js" ;;
+      python) pretty_stack="Python" ;;
+      *) pretty_stack="$auto_stack" ;;
+    esac
+
+    # Directorio global del stack (centralized helper)
+    local stack_dir_display
+    stack_dir_display=$(get_stack_root "$auto_stack")
+
+    # Capas disponibles vía helper único (agents incluye legacy subagents)
+    local tools_available=()
+    local layer
+    while read -r layer; do
+      case "$layer" in
+        agents|skills|commands|checklists) tools_available+=("$layer") ;;
+      esac
+      # Legacy: si el directorio real es subagents, lo indicamos al final
+    done < <(list_stack_layers "$auto_stack")
+    local has_agents=false
+    local has_subagents=false
+    stack_has_layer "$auto_stack" "agents" && has_agents=true
+    [ -d "$stack_dir_display/subagents" ] && [ ! -d "$stack_dir_display/agents" ] && has_subagents=true
+
+    {
+      echo "---"
+      echo "description: IAGT Governance — ${pretty_stack} stack (rules, security, architecture)"
+      echo "alwaysApply: true"
+      echo "---"
+      echo ""
+      echo "# IAGT Governance — ${pretty_stack} Stack"
+      echo ""
+      echo "Stack: $auto_stack"
+      echo "Version: (unpinned)"
+      echo "Catalog: $stack_dir_display"
+      echo ""
+      echo "---"
+      echo ""
+      echo "## Loaded rules"
+      echo ""
+      # Main rule — carga real en contexto de Cursor
+      # Mapa stack → nombre real de la rule
+      local rule_filename
+      case "$auto_stack" in
+        node) rule_filename="nodejs-main-rule.md" ;;
+        *)    rule_filename="${auto_stack}-main-rule.md" ;;
+      esac
+      if [ -f "$stack_dir_display/rules/${rule_filename}" ]; then
+        echo "@$stack_dir_display/rules/${auto_stack}-main-rule.md"
+        echo ""
+      fi
+      echo "---"
+      echo ""
+      echo "## Governance catalog"
+      echo ""
+      echo "All governance resources are in: $stack_dir_display"
+      echo ""
+      echo "Key documents:"
+      [ -f "$stack_dir_display/architecture/${auto_stack}-legacy-architecture.md" ] && \
+        echo "- architecture/${auto_stack}-legacy-architecture.md"
+      [ -f "$stack_dir_display/multishop/MULTISHOP_DATA_MODEL.md" ] && \
+        echo "- multishop/MULTISHOP_DATA_MODEL.md"
+      [ -f "$stack_dir_display/patterns/${auto_stack}-iagt-patterns.md" ] && \
+        echo "- patterns/${auto_stack}-iagt-patterns.md"
+      [ -f "$stack_dir_display/conventions/CODING_CONVENTIONS.md" ] && \
+        echo "- conventions/CODING_CONVENTIONS.md"
+      echo ""
+      echo "Governance tools:"
+      if [ ${#tools_available[@]} -gt 0 ]; then
+        local t
+        for t in "${tools_available[@]}"; do
+          echo "- $stack_dir_display/$t/"
+        done
+        if [ "$has_subagents" = true ] && [ "$has_agents" = false ]; then
+          echo "- $stack_dir_display/subagents/ (legacy agents)"
+        fi
+      else
+        echo "(none detected)"
+      fi
+      # SDD Orchestrator addon — si existe en el catálogo
+      if [ -f "$stack_dir_display/rules/sdd-orchestrator-addon.md" ]; then
+        echo ""
+        cat "$stack_dir_display/rules/sdd-orchestrator-addon.md"
+      fi
+    } > "$GOV_STACK_RULE"
+
+    log_ok "Governance entrypoint generado: $GOV_STACK_RULE"
+
+    # Generar governance-security.mdc con globs PHP/Smarty
+    if [ -f "$stack_dir_display/security/${auto_stack}-security.md" ]; then
+      {
+        echo "---"
+        echo "description: IAGT ${pretty_stack} security rules — SQL injection, CSRF, uploads, locking"
+        echo "globs: \"**/*.php,**/*.tpl\""
+        echo "alwaysApply: false"
+        echo "---"
+        echo ""
+        echo "@$stack_dir_display/security/${auto_stack}-security.md"
+      } > "$GOV_SECURITY_RULE"
+      log_ok "Security rule generada: $GOV_SECURITY_RULE (globs: *.php, *.tpl)"
+    fi
+
+    # Generar governance-modules.mdc con globs modules/iagt_*/
+    generate_modules_rule "$auto_stack" "$stack_dir_display"
+
+    # Generar AGENTS.md en raíz del proyecto
+    generate_agents_md "$auto_stack" "$stack_dir_display"
+
+    # Generar .cursorindexignore
+    setup_cursorindexignore "$auto_stack"
+
+    # Crear .cursor/plans/ para planificación versionada
+    setup_cursor_plans
+
+    # Generar .cursorignore base si no existe
+    setup_cursorignore "$auto_stack"
+
+    # Sincronizar commands y skills al proyecto
+    setup_cursor_commands "$auto_stack"
+    setup_cursor_skills "$auto_stack"
+    setup_cursor_skills_prebuilt "$auto_stack"
+    setup_cursor_agents "$auto_stack"
+    setup_cursor_hooks
+
+    echo ""
+    echo "============================================================"
+    echo "  APPLY COMPLETADO (modo auto-detección)"
+    echo "============================================================"
+    echo ""
+    echo "  Stack detectado: $auto_stack"
+    echo "  Rule:            $GOV_STACK_RULE"
+    echo ""
+    echo "Este proyecto ya tiene un punto de entrada de governance para Cursor."
+    echo ""
+    exit 0
+  fi
+  
+  # MODO 2: Con pin → flujo clásico basado en catálogo y tags + governance-stack.mdc rico (MDC format)
+  # Validar formato del pin
+  if ! validate_pin_format "$PIN_FILE"; then
+    exit 1
+  fi
+  
+  # Leer valores del pin
+  local stack core_version stack_version
+  stack=$(grep "^stack:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+  core_version=$(grep "^core:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+  stack_version=$(grep "^stack_version:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+  
+  log_info "Pin: stack=$stack, core=$core_version, stack_version=$stack_version"
+  
+  # PUNTO CRÍTICO 2: Validar que stack coincide con estructura
+  if ! validate_stack_consistency "$stack"; then
+    exit 1
+  fi
+  
+  # Verificar que el stack existe en el catálogo (centralized stack root)
+  local stack_dir core_dir
+  stack_dir=$(get_stack_root "$stack")
+  core_dir="$GOVERNANCE_DIR/core"
+  
+  if [ ! -d "$stack_dir" ]; then
+    log_error "Stack '$stack' no está instalado en el catálogo."
+    log_error "Ejecuta: iagt-governance install"
+    exit 1
+  fi
+  
+  # Fetch tags para asegurar que tenemos los últimos
+  log_info "Actualizando tags..."
+  git -C "$core_dir" fetch --tags 2>/dev/null || true
+  git -C "$stack_dir" fetch --tags 2>/dev/null || true
+  
+  # Verificar que los tags existen (SIN hacer checkout)
+  if ! tag_exists_local "$core_dir" "$core_version"; then
+    log_error "Tag '$core_version' no existe en core"
+    log_error "Tags disponibles: $(git -C "$core_dir" tag -l | tail -5 | tr '\n' ' ')"
+    exit 1
+  fi
+  log_ok "Core tag existe: $core_version"
+  
+  if ! tag_exists_local "$stack_dir" "$stack_version"; then
+    log_error "Tag '$stack_version' no existe en $stack"
+    log_error "Tags disponibles: $(git -C "$stack_dir" tag -l | tail -5 | tr '\n' ' ')"
+    exit 1
+  fi
+  log_ok "$stack tag existe: $stack_version"
+  
+  # Obtener path de la rule en el repo (legacy) para extraer contenido completo
+  local rule_path
+  rule_path=$(get_rule_path_in_repo "$stack")
+  
+  # Verificar que la rule existe en ese tag
+  if ! file_exists_in_tag "$stack_dir" "$stack_version" "$rule_path"; then
+    log_error "No se encontró $rule_path en tag $stack_version"
+    exit 1
+  fi
+  
+  # CRÍTICO: Extraer contenido SIN cambiar estado del catálogo
+  # Esto permite tener múltiples proyectos con diferentes versiones abiertos
+  local rule_content
+  rule_content=$(git_show_file "$stack_dir" "$stack_version" "$rule_path")
+  
+  if [ -z "$rule_content" ]; then
+    log_error "No se pudo extraer contenido de $rule_path"
+    exit 1
+  fi
+  
+  log_info "Rule extraída de: $stack_version:$rule_path"
+  
+  # Crear directorio .cursor/rules
+  mkdir -p "$CURSOR_RULES_DIR"
+  
+  # Calcular hash del contenido
+  local rule_hash
+  rule_hash=$(echo "$rule_content" | sha256sum | awk '{print $1}')
+  
+  # Generar archivo .generated (para referencia, no para usar como pin)
+  cat > "$GENERATED_FILE" <<EOF
+# IAGT Governance — Estado generado
+# Generado por: iagt-governance apply
+# Fecha: $(date +%Y-%m-%d)
+#
+# Este archivo es INFORMATIVO. El pin real es $PIN_FILE.
+# NOTA: El catálogo NO fue modificado. Se usó git show para extraer el contenido.
+
+stack: $stack
+core: $core_version
+stack_version: $stack_version
+
+# Metadata
+rule_hash: $rule_hash
+rule_source: $stack_version:$rule_path
+applied_by: $(whoami)
+applied_at: $(date -Iseconds)
+EOF
+  
+  log_ok "Estado generado: $GENERATED_FILE"
+ 
+  # Generar governance-stack.mdc (MDC format — entrypoint para Cursor)
+  mkdir -p "$CURSOR_RULES_DIR"
+
+  # Resolver manifest (opcional) y rule principal (puede venir del manifest o del legacy)
+  local manifest_file manifest_rel
+  manifest_file=$(get_stack_manifest "$stack")
+  if [ -n "$manifest_file" ]; then
+    manifest_rel="manifest/stack-manifest.yml"
+  else
+    manifest_rel=""
+  fi
+
+  local primary_rule_source primary_rule_rel
+  primary_rule_source=$(get_rule_source "$stack")
+  if [ -n "$primary_rule_source" ] && [[ "$primary_rule_source" == "$stack_dir/"* ]]; then
+    primary_rule_rel="${primary_rule_source#$stack_dir/}"
+  elif [ -n "$primary_rule_source" ]; then
+    primary_rule_rel="$primary_rule_source"
+  else
+    primary_rule_rel="$rule_path"
+  fi
+
+  # Capas disponibles vía helper único (list_stack_layers; agents incluye legacy subagents)
+  local tools_available=()
+  local layer
+  while read -r layer; do
+    case "$layer" in
+      agents|skills|commands|checklists) tools_available+=("$layer") ;;
+    esac
+  done < <(list_stack_layers "$stack")
+  local has_agents=false
+  local has_subagents=false
+  stack_has_layer "$stack" "agents" && has_agents=true
+  [ -d "$stack_dir/subagents" ] && [ ! -d "$stack_dir/agents" ] && has_subagents=true
+
+  {
+    echo "---"
+    echo "description: IAGT Governance — ${stack} stack (rules, security, architecture)"
+    echo "alwaysApply: true"
+    echo "---"
+    echo ""
+    echo "# IAGT Governance — ${stack} Stack"
+    echo ""
+    echo "Stack: $stack"
+    echo "Version: $stack_version"
+    echo "Catalog: $stack_dir"
+    echo ""
+    echo "---"
+    echo ""
+    echo "## Loaded rules"
+    echo ""
+    # Main rule — carga real en contexto de Cursor
+    if [ -f "$stack_dir/$primary_rule_rel" ]; then
+      echo "@$stack_dir/$primary_rule_rel"
+      echo ""
+    elif [ -f "$primary_rule_source" ]; then
+      echo "@$primary_rule_source"
+      echo ""
+    fi
+    echo "---"
+    echo ""
+    echo "## Governance catalog"
+    echo ""
+    echo "All governance resources are in: $stack_dir"
+    echo ""
+    echo "Key documents:"
+    [ -f "$stack_dir/architecture/${stack}-legacy-architecture.md" ] && \
+      echo "- architecture/${stack}-legacy-architecture.md"
+    [ -f "$stack_dir/multishop/MULTISHOP_DATA_MODEL.md" ] && \
+      echo "- multishop/MULTISHOP_DATA_MODEL.md"
+    [ -f "$stack_dir/patterns/${stack}-iagt-patterns.md" ] && \
+      echo "- patterns/${stack}-iagt-patterns.md"
+    [ -f "$stack_dir/conventions/CODING_CONVENTIONS.md" ] && \
+      echo "- conventions/CODING_CONVENTIONS.md"
+    if [ -n "$manifest_rel" ]; then
+      echo "- $manifest_rel"
+    fi
+    echo ""
+    echo "Governance tools:"
+    if [ ${#tools_available[@]} -gt 0 ]; then
+      local t
+      for t in "${tools_available[@]}"; do
+        echo "- $stack_dir/$t/"
+      done
+      if [ "$has_subagents" = true ] && [ "$has_agents" = false ]; then
+        echo "- $stack_dir/subagents/ (legacy agents)"
+      fi
+    else
+      echo "(none detected)"
+    fi
+  } > "$GOV_STACK_RULE"
+
+  log_ok "Governance stack descriptor generado: $GOV_STACK_RULE"
+
+  # Generar governance-security.mdc — lee del manifest del stack
+  local sec_file_rel sec_file sec_globs sec_desc sec_ref_rel sec_ref
+  sec_file_rel=$(read_manifest_field "$stack_dir" "cli.security.file" 2>/dev/null)
+  sec_globs=$(read_manifest_field "$stack_dir" "cli.security.globs" 2>/dev/null)
+  sec_desc=$(read_manifest_field "$stack_dir" "cli.security.description" 2>/dev/null)
+  sec_ref_rel=$(read_manifest_field "$stack_dir" "cli.security.reference" 2>/dev/null)
+
+  # Fallback si el manifest no tiene sección cli.security
+  if [ -z "$sec_file_rel" ]; then
+    sec_file_rel="security/${stack}-security.md"
+    sec_globs="**/*.php,**/*.tpl"
+    sec_desc="IAGT ${stack} security rules"
+  fi
+
+  sec_file="$stack_dir/$sec_file_rel"
+  [ -n "$sec_ref_rel" ] && sec_ref="$stack_dir/$sec_ref_rel" || sec_ref=""
+
+  if [ -f "$sec_file" ]; then
+    {
+      echo "---"
+      echo "description: ${sec_desc}"
+      echo "globs: \"${sec_globs}\""
+      echo "alwaysApply: false"
+      echo "---"
+      echo ""
+      echo "@${sec_file}"
+      echo ""
+      [ -n "$sec_ref" ] && [ -f "$sec_ref" ] && echo "For code examples: @${sec_ref}"
+    } > "$GOV_SECURITY_RULE"
+    log_ok "Security rule generada: $GOV_SECURITY_RULE (globs: ${sec_globs})"
+  fi
+
+  # Generar governance-modules.mdc con globs modules/iagt_*/
+  generate_modules_rule "$stack" "$stack_dir"
+
+  # Generar AGENTS.md en raíz del proyecto
+  generate_agents_md "$stack" "$stack_dir"
+
+  # Generar .cursorindexignore
+  setup_cursorindexignore "$stack"
+
+  # Crear .cursor/plans/ para planificación versionada
+  setup_cursor_plans
+
+  # Generar .cursorignore base si no existe
+  setup_cursorignore "$stack"
+
+  # Sincronizar commands y skills al proyecto
+  setup_cursor_commands "$stack"
+  setup_cursor_skills "$stack"
+  setup_cursor_skills_prebuilt "$stack"
+  setup_cursor_agents "$stack"
+  setup_cursor_hooks
+
+  # Verificar que existen los dos .mdc esperados
+  local rule_count
+  rule_count=$(find "$CURSOR_RULES_DIR" -maxdepth 1 -name "*.mdc" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$rule_count" -ne 3 ]; then
+    log_warn "Hay $rule_count rules (.mdc) en $CURSOR_RULES_DIR (se esperan 3: stack + security + modules)"
+  fi
+
+  echo ""
+  echo "============================================================"
+  echo "  APPLY COMPLETADO"
+  echo "============================================================"
+  echo ""
+  echo "  Stack:             $stack"
+  echo "  Core:              $core_version"
+  echo "  Stack version:     $stack_version"
+  echo "  Governance entry:  $GOV_STACK_RULE"
+  echo ""
+  echo "  Archivos generados (no commitear):"
+  echo "    .cursor/rules/governance-stack.mdc  (alwaysApply: true — main rule)"
+  echo "    .cursor/rules/governance-security.mdc (globs: según stack — security rules)"
+  echo "    .cursor/rules/governance-modules.mdc  (globs: según stack — architecture)"
+  echo "    AGENTS.md                              (instrucciones para agentes — raíz)"
+  echo "    .cursor/commands/  (commands del stack)"
+  echo "    .cursor/skills/    (skills del stack)"
+  echo "    .cursor/hooks.json + .cursor/hooks/ (hooks de governance)"
+  echo "    .iagt-governance.yml.generated"
+  [ -f ".cursorignore" ] && echo "    .cursorignore (si era nuevo — revisar antes de commitear)"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: update
+# ============================================================
+
+cmd_update() {
+  echo "============================================================"
+  echo "  IAGT Governance — Actualizar catálogo local"
+  echo "============================================================"
+  echo ""
+  
+  if [ ! -d "$GOVERNANCE_DIR" ]; then
+    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    exit 1
+  fi
+  
+  local stacks=("core" "prestashop" "magento")
+  
+  for stack in "${stacks[@]}"; do
+    local stack_dir="$GOVERNANCE_DIR/$stack"
+    if [ -d "$stack_dir" ]; then
+      log_info "Actualizando $stack..."
+      
+      # SOLO fetch, NO pull (para no romper el checkout actual)
+      git -C "$stack_dir" fetch --tags 2>/dev/null || log_warn "$stack: fetch falló"
+      git -C "$stack_dir" fetch origin 2>/dev/null || true
+      
+      # Mostrar tags disponibles (últimos 5)
+      local latest_tags
+      latest_tags=$(git -C "$stack_dir" tag -l --sort=-v:refname | head -5 | tr '\n' ' ')
+      log_ok "$stack: fetch OK (últimos tags: $latest_tags)"
+    else
+      log_warn "$stack: no instalado"
+    fi
+  done
+  
+  echo ""
+  log_ok "Catálogo actualizado (solo fetch, sin cambiar checkout)"
+  echo ""
+  echo "IMPORTANTE: update NO cambia el checkout actual."
+  echo "Para aplicar una versión diferente, usa:"
+  echo "  iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
+  echo "  iagt-governance apply"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: bump
+# ============================================================
+
+cmd_bump() {
+  echo "============================================================"
+  echo "  IAGT Governance — Actualizar pin de versiones"
+  echo "============================================================"
+  echo ""
+  
+  # Verificar catálogo instalado
+  if [ ! -d "$GOVERNANCE_DIR" ]; then
+    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    exit 1
+  fi
+  
+  # Parsear argumentos
+  local new_core=""
+  local new_stack=""
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --core)
+        new_core="$2"
+        shift 2
+        ;;
+      --stack)
+        new_stack="$2"
+        shift 2
+        ;;
+      *)
+        log_error "Argumento desconocido: $1"
+        echo ""
+        echo "Uso: iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
+        exit 1
+        ;;
+    esac
+  done
+  
+  if [ -z "$new_core" ] && [ -z "$new_stack" ]; then
+    log_error "Debes especificar al menos --core o --stack"
+    echo ""
+    echo "Uso: iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
+    exit 1
+  fi
+  
+  # Verificar que existe pin file
+  if [ ! -f "$PIN_FILE" ]; then
+    log_error "No existe $PIN_FILE"
+    echo ""
+    echo "Primero crea un pin inicial. Ejemplo:"
+    echo ""
+    echo "  cat > $PIN_FILE << 'EOF'"
+    echo "  stack: prestashop"
+    echo "  core: v2.1.1"
+    echo "  stack_version: v2.0.5"
+    echo "  EOF"
+    exit 1
+  fi
+  
+  # Leer valores actuales
+  local current_stack current_core current_stack_version
+  current_stack=$(grep "^stack:" "$PIN_FILE" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  current_core=$(grep "^core:" "$PIN_FILE" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  current_stack_version=$(grep "^stack_version:" "$PIN_FILE" 2>/dev/null | cut -d':' -f2 | tr -d '[:space:]')
+  
+  # Aplicar nuevos valores o mantener actuales
+  local final_core="${new_core:-$current_core}"
+  local final_stack_version="${new_stack:-$current_stack_version}"
+  
+  # PUNTO CRÍTICO 4: Validar que los tags existen
+  local core_dir="$GOVERNANCE_DIR/core"
+  local stack_dir="$GOVERNANCE_DIR/$current_stack"
+  
+  # Fetch tags primero
+  log_info "Verificando tags en remoto..."
+  git -C "$core_dir" fetch --tags 2>/dev/null || true
+  git -C "$stack_dir" fetch --tags 2>/dev/null || true
+  
+  if [ -n "$new_core" ]; then
+    if ! tag_exists_local "$core_dir" "$new_core"; then
+      log_error "Tag '$new_core' NO existe en core"
+      echo ""
+      echo "Tags disponibles:"
+      git -C "$core_dir" tag -l | tail -10
+      exit 1
+    fi
+    log_ok "Tag '$new_core' existe en core"
+  fi
+  
+  if [ -n "$new_stack" ]; then
+    if ! tag_exists_local "$stack_dir" "$new_stack"; then
+      log_error "Tag '$new_stack' NO existe en $current_stack"
+      echo ""
+      echo "Tags disponibles:"
+      git -C "$stack_dir" tag -l | tail -10
+      exit 1
+    fi
+    log_ok "Tag '$new_stack' existe en $current_stack"
+  fi
+  
+  echo ""
+  echo "Cambios propuestos:"
+  echo ""
+  if [ -n "$new_core" ]; then
+    echo "  core:          $current_core → $new_core"
+  else
+    echo "  core:          $current_core (sin cambios)"
+  fi
+  if [ -n "$new_stack" ]; then
+    echo "  stack_version: $current_stack_version → $new_stack"
+  else
+    echo "  stack_version: $current_stack_version (sin cambios)"
+  fi
+  echo ""
+  
+  # Mostrar diff
+  local tmp_new
+  tmp_new=$(mktemp)
+  cat > "$tmp_new" <<EOF
+stack: $current_stack
+core: $final_core
+stack_version: $final_stack_version
+EOF
+  
+  echo "Diff:"
+  diff -u "$PIN_FILE" "$tmp_new" || true
+  echo ""
+  
+  read -p "¿Aplicar cambios al pin? [y/N] " -n 1 -r
+  echo
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    log_info "Cancelado"
+    rm -f "$tmp_new"
+    exit 0
+  fi
+  
+  # Aplicar cambios
+  mv "$tmp_new" "$PIN_FILE"
+  log_ok "Pin actualizado: $PIN_FILE"
+  
+  echo ""
+  echo "============================================================"
+  echo "  BUMP COMPLETADO"
+  echo "============================================================"
+  echo ""
+  echo "Próximos pasos:"
+  echo "  1. iagt-governance apply     # Regenerar rule con nuevas versiones"
+  echo "  2. iagt-governance verify    # Verificar integridad"
+  echo "  3. git add $PIN_FILE"
+  echo "  4. git commit -m 'chore: update governance to $final_core / $final_stack_version'"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: status
+# ============================================================
+
+cmd_status() {
+  check_project_root "status"
+  echo "============================================================"
+  echo "  IAGT Governance — Estado del proyecto"
+  echo "============================================================"
+  echo ""
+  
+  # Detectar stack
+  local stack="(no detectado)"
+  if detect_stack >/dev/null 2>&1; then
+    stack=$(detect_stack)
+  fi
+  
+  echo "Directorio: $(pwd)"
+  echo "Stack:      $stack"
+  echo ""
+  
+  # .iagt-governance.yml (pin file)
+  if [ -f "$PIN_FILE" ]; then
+    echo "[OK]   $PIN_FILE existe (pin de versiones)"
+    grep -E "^(stack|core|stack_version):" "$PIN_FILE" 2>/dev/null | sed 's/^/       /'
+  else
+    echo "[WARN] $PIN_FILE no existe (sin pin de versiones)"
+  fi
+  
+  # .iagt-governance.yml.generated
+  if [ -f "$GENERATED_FILE" ]; then
+    echo "[OK]   $GENERATED_FILE existe"
+    local applied
+    applied=$(grep "^applied_at:" "$GENERATED_FILE" 2>/dev/null | cut -d' ' -f2 || echo "")
+    [ -n "$applied" ] && echo "       Generado: $applied"
+  else
+    echo "[INFO] $GENERATED_FILE no existe (ejecuta: iagt-governance apply)"
+  fi
+  
+  # .cursor/rules (governance entrypoint para Cursor)
+  if [ -f "$GOV_STACK_RULE" ]; then
+    echo "[OK]   $GOV_STACK_RULE existe (governance entrypoint)"
+  else
+    echo "[FAIL] No existe $GOV_STACK_RULE (ejecuta: iagt-governance apply)"
+  fi
+  
+  # Catálogo
+  echo ""
+  echo "Catálogo local: $GOVERNANCE_DIR"
+  if [ -d "$GOVERNANCE_DIR" ]; then
+    for s in core prestashop magento; do
+      if [ -d "$GOVERNANCE_DIR/$s" ]; then
+        local ver
+        ver=$(git -C "$GOVERNANCE_DIR/$s" describe --tags 2>/dev/null || echo "dev")
+        echo "  $s: $ver"
+      fi
+    done
+  else
+    echo "  (no instalado)"
+  fi
+  
+  echo ""
+}
+
+# ============================================================
+# COMANDO: verify
+# ============================================================
+
+cmd_verify() {
+  check_project_root "verify"
+  echo "============================================================"
+  echo "  IAGT Governance — Verificar integridad"
+  echo "============================================================"
+  echo ""
+
+  local exit_code=0
+
+  # 1. Entrypoint MDC existe y tiene alwaysApply
+  if [ ! -f "$GOV_STACK_RULE" ]; then
+    log_error "No existe governance-stack.mdc en $CURSOR_RULES_DIR"
+    echo "       Ejecuta: iagt-governance apply"
+    exit 1
+  fi
+  if grep -q "alwaysApply: true" "$GOV_STACK_RULE" 2>/dev/null; then
+    log_ok "Entrypoint MDC: $GOV_STACK_RULE (alwaysApply: true)"
+  else
+    log_warn "governance-stack.mdc no tiene alwaysApply: true — regenerar con apply"
+    exit_code=1
+  fi
+
+  # 2. Security rule con globs
+  if [ -f "$GOV_SECURITY_RULE" ]; then
+    if grep -q "globs:" "$GOV_SECURITY_RULE" 2>/dev/null; then
+      log_ok "Security rule MDC: $GOV_SECURITY_RULE (globs)"
+    else
+      log_warn "governance-security.mdc no tiene globs — regenerar con apply"
+      exit_code=1
+    fi
+  else
+    log_warn "No existe governance-security.mdc — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  # 3. Modules rule con globs
+  if [ -f "$GOV_MODULES_RULE" ]; then
+    log_ok "Modules rule MDC: $GOV_MODULES_RULE (globs)"
+  else
+    log_warn "No existe governance-modules.mdc — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  # 4. Detectar stack
+  local stack
+  if ! stack=$(resolve_active_stack); then
+    log_error "No se pudo detectar stack"
+    exit 1
+  fi
+  log_ok "Stack: $stack"
+
+  # 5. Stack en catálogo
+  local stack_dir
+  stack_dir=$(get_stack_root "$stack")
+  if [ ! -d "$stack_dir" ]; then
+    log_error "Stack '$stack' no instalado en catálogo"
+    exit 1
+  fi
+  log_ok "Catálogo: $stack_dir"
+
+  # 6. @ references apuntan a archivos existentes
+  local broken=0
+  while IFS= read -r ref; do
+    local ref_path="${ref#@}"
+    if [ ! -f "$ref_path" ]; then
+      log_warn "@ reference rota: $ref_path"
+      broken=$((broken + 1))
+    fi
+  done < <(grep "^@" "$GOV_STACK_RULE" "$GOV_SECURITY_RULE" "$GOV_MODULES_RULE" 2>/dev/null | grep -v "^Binary\|^--$" | sed 's/^[^:]*://')
+  [ "$broken" -eq 0 ] && log_ok "@ references: todas válidas" || { log_warn "$broken @ reference(s) rotas"; exit_code=1; }
+
+  # 7. Commands sincronizados
+  local cmd_count
+  cmd_count=$(find ".cursor/commands" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$cmd_count" -gt 0 ]; then
+    log_ok "Commands: $cmd_count en .cursor/commands/"
+  else
+    log_warn "No hay commands en .cursor/commands/ — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  # 8. Skills generadas
+  local skill_count
+  skill_count=$(find ".cursor/skills" -name "SKILL.md" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$skill_count" -gt 0 ]; then
+    log_ok "Skills: $skill_count en .cursor/skills/"
+  else
+    log_warn "No hay skills en .cursor/skills/ — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  # 9. Hooks configurados
+  if [ -f ".cursor/hooks.json" ]; then
+    log_ok "Hooks: .cursor/hooks.json existe"
+  else
+    log_warn "No existe .cursor/hooks.json — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  # 10. AGENTS.md
+  if [ -f "AGENTS.md" ]; then
+    log_ok "AGENTS.md existe en raíz"
+  else
+    log_warn "No existe AGENTS.md — ejecuta: iagt-governance apply"
+    exit_code=1
+  fi
+
+  echo ""
+  if [ $exit_code -eq 0 ]; then
+    echo "✅ VERIFICACIÓN EXITOSA"
+  else
+    echo "⚠️  VERIFICACIÓN CON ADVERTENCIAS — ejecuta: iagt-governance apply"
+  fi
+  echo ""
+
+  exit $exit_code
+}
+
+# ============================================================
+# COMANDO: doctor
+# ============================================================
+
+cmd_doctor() {
+  echo "============================================================"
+  echo "  IAGT Governance — Diagnóstico del sistema"
+  echo "============================================================"
+  echo ""
+  
+  local issues=0
+  
+  # 1. Git instalado
+  echo "[CHECK] Git..."
+  if command -v git >/dev/null 2>&1; then
+    log_ok "Git instalado: $(git --version)"
+  else
+    log_error "Git NO instalado"
+    ((issues++))
+  fi
+  
+  # 2. SSH access
+  echo "[CHECK] Acceso SSH a Bitbucket..."
+  if check_ssh_access; then
+    log_ok "SSH disponible"
+  else
+    log_warn "SSH NO disponible (se usará HTTPS)"
+  fi
+  
+  # 3. Catálogo instalado
+  echo "[CHECK] Catálogo local..."
+  if [ -d "$GOVERNANCE_DIR" ]; then
+    log_ok "Catálogo existe: $GOVERNANCE_DIR"
+    
+    for s in core prestashop magento; do
+      if [ -d "$GOVERNANCE_DIR/$s" ]; then
+        local ver
+        ver=$(git -C "$GOVERNANCE_DIR/$s" describe --tags 2>/dev/null || echo "dev")
+        local status
+        if git -C "$GOVERNANCE_DIR/$s" status --porcelain 2>/dev/null | grep -q .; then
+          status=" [DIRTY]"
+          log_warn "  $s: $ver$status"
+        else
+          log_ok "  $s: $ver"
+        fi
+      else
+        log_warn "  $s: no instalado"
+      fi
+    done
+  else
+    log_error "Catálogo NO instalado"
+    echo "       Ejecuta: iagt-governance install"
+    ((issues++))
+  fi
+  
+  # 4. Gitignore global
+  echo "[CHECK] Gitignore global..."
+  local current_excludes
+  current_excludes=$(git config --global core.excludesfile 2>/dev/null || true)
+  if [ -n "$current_excludes" ] && [ -f "$current_excludes" ]; then
+    if grep -q ".cursor/" "$current_excludes" 2>/dev/null; then
+      log_ok "Gitignore global configurado: $current_excludes"
+    else
+      log_warn "Gitignore global existe pero falta .cursor/"
+      echo "       Añade manualmente: echo '.cursor/' >> $current_excludes"
+    fi
+  else
+    log_warn "Gitignore global NO configurado"
+    echo "       Ejecuta: iagt-governance install (lo configura automáticamente)"
+  fi
+  
+  # 5. Cursor
+  echo "[CHECK] Cursor..."
+  if check_cursor_installed; then
+    log_ok "Cursor detectado"
+  else
+    log_warn "Cursor NO detectado"
+    echo "       Instala desde: https://cursor.sh"
+  fi
+  
+  # 6. Proyecto actual
+  echo ""
+  echo "[CHECK] Proyecto actual ($(pwd))..."
+  if [ -f "$PIN_FILE" ]; then
+    log_ok "Pin existe: $PIN_FILE"
+    grep -E "^(stack|core|stack_version):" "$PIN_FILE" 2>/dev/null | sed 's/^/       /'
+    
+    # Verificar que versiones del pin coinciden con checkout
+    local pin_stack pin_core pin_stack_ver
+    pin_stack=$(grep "^stack:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+    pin_core=$(grep "^core:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+    pin_stack_ver=$(grep "^stack_version:" "$PIN_FILE" | cut -d':' -f2 | tr -d '[:space:]')
+    
+    if [ -d "$GOVERNANCE_DIR/core" ]; then
+      local current_core
+      current_core=$(git -C "$GOVERNANCE_DIR/core" describe --tags --exact-match 2>/dev/null || echo "")
+      if [ "$current_core" = "$pin_core" ]; then
+        log_ok "  Core checkout coincide con pin"
+      else
+        log_warn "  Core checkout ($current_core) ≠ pin ($pin_core)"
+        echo "         Ejecuta: iagt-governance apply"
+      fi
+    fi
+    
+    local pin_stack_dir
+    pin_stack_dir=$(get_stack_root "$pin_stack")
+    if [ -d "$pin_stack_dir" ]; then
+      local current_stack
+      current_stack=$(git -C "$pin_stack_dir" describe --tags --exact-match 2>/dev/null || echo "")
+      if [ "$current_stack" = "$pin_stack_ver" ]; then
+        log_ok "  $pin_stack checkout coincide con pin"
+      else
+        log_warn "  $pin_stack checkout ($current_stack) ≠ pin ($pin_stack_ver)"
+        echo "         Ejecuta: iagt-governance apply"
+      fi
+    fi
+
+    # Manifest del stack (opcional)
+    local manifest_path
+    manifest_path=$(get_stack_manifest "$pin_stack")
+    if [ -n "$manifest_path" ]; then
+      if [ -r "$manifest_path" ]; then
+        log_ok "  Manifest detectado y legible: $manifest_path"
+      else
+        log_warn "  Manifest detectado pero NO legible: $manifest_path"
+      fi
+    else
+      log_info "  Manifest no presente para stack '$pin_stack' (modo legacy)"
+    fi
+  else
+    log_warn "Sin pin en este directorio"
+    echo "       WARNING: Project is not pinned to a governance version."
+    echo "       Recommended command:"
+    echo "         iagt-governance apply"
+    echo "       Si es proyecto nuevo: iagt-governance init ..."
+    # Intentar detectar stack por estructura aunque no haya pin
+    local struct_stack
+    if struct_stack=$(detect_stack_by_structure); then
+      log_info "Stack detected (structure): $struct_stack"
+    else
+      log_info "Stack detected (structure): (no detectado)"
+    fi
+  fi
+  
+  # Cursor: rules, commands, skills, hooks, AGENTS.md
+  echo ""
+  echo "[CHECK] Proyecto actual — Cursor setup ($(pwd))..."
+  if [ -d "$CURSOR_RULES_DIR" ]; then
+    # governance-stack.mdc
+    if [ -f "$GOV_STACK_RULE" ]; then
+      if grep -q "alwaysApply: true" "$GOV_STACK_RULE" 2>/dev/null; then
+        log_ok "  governance-stack.mdc (alwaysApply: true)"
+      else
+        log_warn "  governance-stack.mdc existe pero sin alwaysApply — ejecuta: apply"
+      fi
+    else
+      log_warn "  governance-stack.mdc NO existe — ejecuta: iagt-governance apply"
+    fi
+    # governance-security.mdc
+    if [ -f "$GOV_SECURITY_RULE" ]; then
+      log_ok "  governance-security.mdc (globs activos)"
+    else
+      log_warn "  governance-security.mdc NO existe — ejecuta: iagt-governance apply"
+    fi
+    # governance-modules.mdc
+    if [ -f "$GOV_MODULES_RULE" ]; then
+      log_ok "  governance-modules.mdc (globs activos)"
+    else
+      log_warn "  governance-modules.mdc NO existe — ejecuta: iagt-governance apply"
+    fi
+  else
+    log_warn "  .cursor/rules/ NO existe — ejecuta: iagt-governance apply"
+    ((issues++))
+  fi
+
+  # commands
+  local cmd_count
+  cmd_count=$(find ".cursor/commands" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$cmd_count" -gt 0 ]; then
+    log_ok "  .cursor/commands/: $cmd_count commands"
+  else
+    log_warn "  .cursor/commands/: vacío — ejecuta: iagt-governance apply"
+  fi
+
+  # skills
+  local skill_count
+  skill_count=$(find ".cursor/skills" -name "SKILL.md" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$skill_count" -gt 0 ]; then
+    log_ok "  .cursor/skills/: $skill_count skills"
+  else
+    log_warn "  .cursor/skills/: vacío — ejecuta: iagt-governance apply"
+  fi
+
+  # hooks
+  if [ -f ".cursor/hooks.json" ]; then
+    log_ok "  .cursor/hooks.json: configurado"
+  else
+    log_warn "  .cursor/hooks.json: NO existe — ejecuta: iagt-governance apply"
+  fi
+
+  # AGENTS.md
+  if [ -f "AGENTS.md" ]; then
+    log_ok "  AGENTS.md: existe en raíz"
+  else
+    log_warn "  AGENTS.md: NO existe — ejecuta: iagt-governance apply"
+  fi
+
+  # .cursorignore
+  if [ -f ".cursorignore" ]; then
+    log_ok "  .cursorignore: existe"
+  else
+    log_warn "  .cursorignore: NO existe — ejecuta: iagt-governance apply"
+  fi
+  
+  echo ""
+  echo "============================================================"
+  if [ $issues -eq 0 ]; then
+    echo "  ✅ Sistema OK"
+  else
+    echo "  ⚠️  $issues problema(s) encontrado(s)"
+  fi
+  echo "============================================================"
+  echo ""
+}
+
+# ============================================================
+# COMANDO: validate
+# ============================================================
+# ============================================================
+# Project validation mode: scan project code with rulesets
+# ============================================================
+# Receives PROJECT_PATH and CI_MODE. Resolves stack, loads rulesets, scans by language,
+# aggregates findings. If CI_MODE=true and findings > 0, exit 1; else exit 0.
+cmd_validate_project() {
+  local PROJECT_PATH="$1"
+  local CI_MODE="${2:-false}"
+  local FINDINGS_COUNT=0
+
+  if [ ! -d "$PROJECT_PATH" ]; then
+    log_error "Project path not found"
+    exit 1
+  fi
+
+  local stack
+  if ! stack=$(resolve_active_stack); then
+    log_error "No se pudo detectar el stack (falta pin o estructura reconocible)"
+    exit 1
+  fi
+  local STACK_DIR
+  STACK_DIR=$(get_stack_root "$stack")
+  if [ ! -d "$STACK_DIR" ]; then
+    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: iagt-governance install"
+    exit 1
+  fi
+
+  # Rulesets: try $STACK_DIR/rulesets/ then CLI rulesets/<stack>/
+  local stack_name
+  stack_name=$(basename "$STACK_DIR" 2>/dev/null)
+  local RULESET="$STACK_DIR/rulesets/security_patterns.sh"
+  [ ! -f "$RULESET" ] && [ -n "${CLI_DIR:-}" ] && RULESET="$CLI_DIR/rulesets/$stack_name/security_patterns.sh"
+
+  # Counters for summary (tracked during safe iteration)
+  local PHP_COUNT=0 JS_COUNT=0 TS_COUNT=0 TPL_COUNT=0
+  local all_findings=""
+  local tmp_f=""
+  local have_runner=0
+
+  if [ -f "$RULESET" ]; then
+    # shellcheck source=/dev/null
+    source "$RULESET" 2>/dev/null || true
+    if type run_security_patterns 2>/dev/null | grep -q function; then
+      have_runner=1
+      tmp_f=$(mktemp)
+    fi
+  else
+    echo "No ruleset available (rulesets/security_patterns.sh)" >&2
+  fi
+
+  # Safe iteration: find -print0 + while IFS= read -r -d '' (handles spaces in paths)
+  while IFS= read -r -d '' file; do
+    ((PHP_COUNT++)) || true
+    [ "$have_runner" -eq 1 ] && run_security_patterns "$file" 2>/dev/null >> "$tmp_f"
+  done < <(find "$PROJECT_PATH" -type f -name "*.php" -print0 2>/dev/null)
+  while IFS= read -r -d '' file; do
+    ((JS_COUNT++)) || true
+    [ "$have_runner" -eq 1 ] && run_security_patterns "$file" 2>/dev/null >> "$tmp_f"
+  done < <(find "$PROJECT_PATH" -type f -name "*.js" -print0 2>/dev/null)
+  while IFS= read -r -d '' file; do
+    ((TS_COUNT++)) || true
+    [ "$have_runner" -eq 1 ] && run_security_patterns "$file" 2>/dev/null >> "$tmp_f"
+  done < <(find "$PROJECT_PATH" -type f -name "*.ts" -print0 2>/dev/null)
+  while IFS= read -r -d '' file; do
+    ((TPL_COUNT++)) || true
+    [ "$have_runner" -eq 1 ] && run_security_patterns "$file" 2>/dev/null >> "$tmp_f"
+  done < <(find "$PROJECT_PATH" -type f -name "*.tpl" -print0 2>/dev/null)
+
+  [ "$have_runner" -eq 1 ] && all_findings=$(sort -u "$tmp_f" 2>/dev/null) && rm -f "$tmp_f"
+
+  if [ -n "$all_findings" ]; then
+    FINDINGS_COUNT=$(echo "$all_findings" | grep -c . 2>/dev/null) || FINDINGS_COUNT=0
+  fi
+
+  echo "---"
+  echo ""
+  echo "Governance validation — project scan"
+  echo ""
+  echo "Project path: $PROJECT_PATH"
+  echo ""
+  echo "Files analyzed:"
+  echo "  PHP: $PHP_COUNT"
+  echo "  JS: $JS_COUNT"
+  echo "  TS: $TS_COUNT"
+  echo "  TPL: $TPL_COUNT"
+  echo ""
+
+  echo "Findings:"
+  if [ -n "$all_findings" ]; then
+    echo "$all_findings" | while read -r line; do
+      [ -n "$line" ] && echo "* $line"
+    done
+  else
+    echo "(none)"
+  fi
+  echo ""
+  echo "---"
+  echo ""
+  echo "Governance validation completed"
+  echo "Mode: project"
+  echo "Findings detected: $FINDINGS_COUNT"
+  echo ""
+  if [ "$CI_MODE" = "true" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
+    echo "Governance violations detected"
+    exit 1
+  fi
+  exit 0
+}
+
+# ============================================================
+# COMANDO: validate (test mode + dispatch)
+# ============================================================
+# The CLI orchestrates governance validation. It resolves stack, test dirs,
+# and expected_findings; domain-specific analysis is delegated to rulesets.
+# validate = governance regression tests (tests/unit).
+# validate --project <path> = project scan (no expected_findings comparison).
+# validate --project <path> --ci = CI mode; exit 1 if violations detected.
+cmd_validate() {
+  # Dispatch project mode: parse --project <path> and optional --ci
+  local CI_MODE=false
+  local PROJECT_PATH=""
+  local saw_project=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)
+        saw_project=true
+        PROJECT_PATH="${2:-}"
+        shift 2
+        ;;
+      --ci)
+        CI_MODE=true
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [ "$saw_project" = true ]; then
+    if [ -z "$PROJECT_PATH" ]; then
+      log_error "Project path required"
+      exit 1
+    fi
+    cmd_validate_project "$PROJECT_PATH" "$CI_MODE"
+    return
+  fi
+
+  # -----------------------------------------------------------------------
+  # Governance test mode (default): run tests from stack tests/unit
+  # Do NOT modify this block; backward compatibility required.
+  # -----------------------------------------------------------------------
+  echo "Running governance validation"
+  echo ""
+
+  # 1. Detectar stack: pin primero, fallback detect_stack_by_structure (centralized)
+  local stack
+  if ! stack=$(resolve_active_stack); then
+    log_error "No se pudo detectar el stack (falta pin o estructura reconocible)"
+    exit 1
+  fi
+  echo "Stack: $stack"
+  echo ""
+
+  # 2. Resolver directorio del stack: ~/.iagt/governance/<stack>
+  local STACK_DIR
+  STACK_DIR=$(get_stack_root "$stack")
+  if [ ! -d "$STACK_DIR" ]; then
+    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: iagt-governance install"
+    exit 1
+  fi
+
+  # 3. Localizar tests/unit (centralized helper)
+  local TESTS_DIR
+  TESTS_DIR=$(get_stack_tests_dir "$stack")
+  if [ -z "$TESTS_DIR" ]; then
+    echo "No governance tests defined for this stack"
+    echo "Governance validation completed"
+    echo "Mode: test"
+    echo ""
+    exit 0
+  fi
+
+  # 4. Iterar tests: tests/unit/<domain>/<test-name>/
+  local TOTAL_TESTS=0
+  local PASSED_TESTS=0
+  local FAILED_TESTS=0
+  local domain="" test_name=""
+
+  while IFS= read -r test_dir; do
+    [ -z "$test_dir" ] && continue
+    domain=$(basename "$(dirname "$test_dir")")
+    test_name=$(basename "$test_dir")
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    echo "Test: $domain/$test_name"
+
+    # Resolve code file (first file in test dir that is not expected_findings.yml)
+    local code_file=""
+    for f in "$test_dir"/*; do
+      [ -f "$f" ] || continue
+      [ "$(basename "$f")" = "expected_findings.yml" ] && continue
+      code_file="$f"
+      break
+    done
+
+    # Run skill runner: agent → skill → checklist + lightweight code scan
+    local FOUND_FINDINGS
+    FOUND_FINDINGS=$(run_skill_for_test "$STACK_DIR" "$domain" "$test_dir" "$code_file")
+
+    # Expected findings from test metadata
+    local expected_file="$test_dir/expected_findings.yml"
+    if [ ! -f "$expected_file" ]; then
+      echo "Detected findings:"
+      echo "$FOUND_FINDINGS" | while read -r line; do [ -n "$line" ] && echo "* $line"; done
+      [ -z "$FOUND_FINDINGS" ] && echo "(none)"
+      echo "Expected findings:"
+      echo "(missing expected_findings.yml)"
+      echo -e "${RED}FAIL${NC} $test_name"
+      FAILED_TESTS=$((FAILED_TESTS + 1))
+      echo ""
+      continue
+    fi
+
+    local expected_findings
+    expected_findings=$(awk '
+      /^[[:space:]]*expected_findings[[:space:]]*:/ { in_list=1; next }
+      in_list && /^[[:space:]]*-[[:space:]]/ { gsub(/^[[:space:]]*-[[:space:]]*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }
+      in_list && /^[[:space:]]*[a-zA-Z0-9_-]+[[:space:]]*:/ { in_list=0 }
+      in_list && /^[[:space:]]*[a-zA-Z]/ && !/^[[:space:]]*-/ { in_list=0 }
+    ' "$expected_file" 2>/dev/null)
+
+    echo "Detected findings:"
+    if [ -n "$FOUND_FINDINGS" ]; then
+      echo "$FOUND_FINDINGS" | while read -r line; do
+        [ -n "$line" ] && echo "* $line"
+      done
+    else
+      echo "(none)"
+    fi
+    echo "Expected findings:"
+    if [ -n "$expected_findings" ]; then
+      echo "$expected_findings" | while read -r line; do
+        [ -n "$line" ] && echo "* $line"
+      done
+    else
+      echo "(none)"
+    fi
+
+    # PASS if all expected findings were detected; FAIL if any missing
+    local pass=true
+    while IFS= read -r exp; do
+      [ -z "$exp" ] && continue
+      if ! echo "$FOUND_FINDINGS" | grep -qFx "$exp" 2>/dev/null; then
+        pass=false
+        break
+      fi
+    done <<< "$expected_findings"
+
+    if [ "$pass" = true ]; then
+      echo -e "${GREEN}PASS${NC} $test_name"
+      PASSED_TESTS=$((PASSED_TESTS + 1))
+    else
+      echo -e "${RED}FAIL${NC} $test_name"
+      FAILED_TESTS=$((FAILED_TESTS + 1))
+    fi
+    echo ""
+  done < <(find "$TESTS_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort)
+
+  # 6. Resumen final
+  echo "---"
+  echo ""
+  echo "Governance validation summary"
+  echo ""
+  echo "tests run: $TOTAL_TESTS"
+  echo "passed: $PASSED_TESTS"
+  echo "failed: $FAILED_TESTS"
+  echo ""
+  echo "---"
+  echo ""
+  echo "Skill runner initialized"
+  echo "Governance validation completed"
+  echo "Mode: test"
+  echo ""
+
+  if [ "$FAILED_TESTS" -gt 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+# ============================================================
+# AYUDA
+# ============================================================
+
+show_help() {
+  cat <<EOF
+iagt-governance — CLI para gestión de gobernanza multi-stack
+
+USO:
+  iagt-governance <comando>
+
+COMANDOS:
+  install     Instala catálogo local (~/.iagt/governance/)
+  init        Crea pin inicial en proyecto nuevo
+  apply       Genera .cursor/rules/governance-stack.mdc según el pin o auto-detección
+  update      Actualiza stacks del catálogo local (git pull)
+  bump        Actualiza versiones en el pin existente
+  status      Muestra estado del proyecto actual
+  verify      Verifica integridad de rule activa
+  validate              Run governance regression tests.
+  validate --project <path>  Analyze project code using governance rules.
+  validate --project <path> --ci  CI mode: exit 1 if violations detected.
+  doctor      Diagnóstico completo del sistema
+  self-update Actualiza el binario del CLI desde el repo local
+  help        Muestra esta ayuda
+
+ARCHIVOS:
+  .iagt-governance.yml           Pin de versiones (COMMITEAR)
+  .iagt-governance.yml.generated Estado local generado (NO commitear)
+  .cursor/rules/governance-stack.mdc  Governance entrypoint (MDC format) (NO commitear)
+
+PROYECTO NUEVO:
+  iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5
+  iagt-governance apply
+  git add .iagt-governance.yml
+  git commit -m "chore: add governance pin"
+
+PROYECTO EXISTENTE (clonar):
+  git clone ...
+  cd proyecto
+  iagt-governance apply
+
+ACTUALIZAR VERSIONES:
+  iagt-governance update
+  iagt-governance bump --core v2.2.0 --stack v2.1.0
+  iagt-governance apply
+  iagt-governance verify
+  git add .iagt-governance.yml
+  git commit -m "chore: update governance"
+
+DIAGNÓSTICO:
+  iagt-governance doctor
+
+VARIABLES DE ENTORNO:
+  IAGT_HOME   Directorio base (default: ~/.iagt)
+
+EOF
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  
+  case "$cmd" in
+    install)
+      cmd_install
+      ;;
+    init)
+      cmd_init "$@"
+      ;;
+    apply)
+      cmd_apply
+      ;;
+    update)
+      cmd_update
+      ;;
+    bump)
+      cmd_bump "$@"
+      ;;
+    status)
+      cmd_status
+      ;;
+    verify)
+      cmd_verify
+      ;;
+    doctor)
+      cmd_doctor
+      ;;
+    self-update)
+      cmd_self_update
+      ;;
+    validate)
+      cmd_validate "$@"
+      ;;
+    help|--help|-h)
+      show_help
+      ;;
+    *)
+      log_error "Comando desconocido: $cmd"
+      echo ""
+      show_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
