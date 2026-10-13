@@ -10,7 +10,7 @@
 
 set -e
 
-PIN_FILE=".iagt-governance.yml"
+PIN_FILE=".cursor-governance.yml"
 
 # ── Colores (desactivados en CI si no hay TTY) ───────────────────────
 if [ -t 1 ]; then
@@ -31,7 +31,7 @@ echo ""
 # 1. Archivo existe
 [ -f "$PIN_FILE" ] || fail "No existe $PIN_FILE en $(pwd)
   El pin de governance es obligatorio en todos los proyectos 
-  Ejecuta: iagt-governance init --stack <stack> --core <ver> --stack-version <ver>"
+  Ejecuta: cursor-governance init --stack <stack> --core <ver> --stack-version <ver>"
 
 # 2. Campos obligatorios
 for field in stack core stack_version; do

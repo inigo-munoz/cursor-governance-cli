@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — Instalador del CLI iagt-governance
+# install.sh — Instalador del CLI cursor-governance
 #
 # Uso:
 #   ./install.sh
 #
 # Qué hace:
 #   - Verifica que Cursor está instalado
-#   - Copia bin/iagt-governance a ~/.local/bin
+#   - Copia bin/cursor-governance a ~/.local/bin
 #   - Ajusta permisos
 #   - Añade ~/.local/bin al PATH si no está
 #   - Configura ~/.gitignore_global
@@ -14,12 +14,12 @@
 #
 # Qué NO hace:
 #   - No clona el catálogo local de governance
-#   - Eso lo hace luego: iagt-governance install
+#   - Eso lo hace luego: cursor-governance install
 
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-CLI_NAME="iagt-governance"
+CLI_NAME="cursor-governance"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_BIN="$SCRIPT_DIR/bin/$CLI_NAME"
 TARGET_BIN="$INSTALL_DIR/$CLI_NAME"
@@ -161,7 +161,7 @@ log_info "Configurando gitignore global..."
 
 changed=false
 append_if_missing '.cursor/'                      "$GITIGNORE_GLOBAL" && changed=true
-append_if_missing '.iagt-governance.yml.generated' "$GITIGNORE_GLOBAL" && changed=true
+append_if_missing '.cursor-governance.yml.generated' "$GITIGNORE_GLOBAL" && changed=true
 
 git config --global core.excludesfile "$GITIGNORE_GLOBAL"
 
@@ -187,15 +187,15 @@ echo "============================================================"
 echo ""
 echo "Próximos pasos:"
 echo "  1. source \"$(detect_shell_rc)\"         # activar PATH en futuras sesiones"
-echo "  2. iagt-governance install              # Instalar catálogo de stacks:"
+echo "  2. cursor-governance install              # Instalar catálogo de stacks:"
 echo "                                          #   1) PrestaShop 8.x"
 echo "                                          #   2) PrestaShop 7.x [legacy]"
 echo "                                          #   3) Magento 2.4"
 echo "                                          #   4) Node.js 22.x LTS"
-echo "  3. iagt-governance doctor               # Verificar instalación"
+echo "  3. cursor-governance doctor               # Verificar instalación"
 echo "  4. cd /tu/proyecto"
-echo "  5. iagt-governance apply                # Aplicar gobernanza"
+echo "  5. cursor-governance apply                # Aplicar gobernanza"
 echo ""
 echo "Si es proyecto nuevo:"
-echo "  iagt-governance init --stack prestashop8 --core v2.2.0 --stack-version v2.4.0"
+echo "  cursor-governance init --stack prestashop8 --core v2.2.0 --stack-version v2.4.0"
 echo ""

@@ -4,9 +4,9 @@
 # Activar con:
 #   git config --global core.excludesfile ~/.gitignore_global
 
-# IAGT Governance (archivos locales generados)
+# Cursor Governance (archivos locales generados)
 .cursor/
-.iagt-governance.yml.generated
+.cursor-governance.yml.generated
 
 # IDEs y editores
 .idea/

@@ -1,13 +1,13 @@
 #!/bin/bash
-# iagt-governance — CLI para gestión de gobernanza multi-stack
+# cursor-governance — CLI para gestión de gobernanza multi-stack
 # Versión: 1.0.0
 #
 # Uso:
-#   iagt-governance install       Instala catálogo local
-#   iagt-governance apply         Genera rule para proyecto actual
-#   iagt-governance update        Actualiza stacks del catálogo
-#   iagt-governance status        Muestra estado del proyecto
-#   iagt-governance verify        Verifica integridad de rule activa
+#   cursor-governance install       Instala catálogo local
+#   cursor-governance apply         Genera rule para proyecto actual
+#   cursor-governance update        Actualiza stacks del catálogo
+#   cursor-governance status        Muestra estado del proyecto
+#   cursor-governance verify        Verifica integridad de rule activa
 
 set -euo pipefail
 
@@ -15,8 +15,8 @@ set -euo pipefail
 # CONFIGURACIÓN
 # ============================================================
 
-IAGT_HOME="${IAGT_HOME:-$HOME/.iagt}"
-GOVERNANCE_DIR="$IAGT_HOME/governance"
+GOVERNANCE_HOME="${GOVERNANCE_HOME:-$HOME/.cursor-governance}"
+GOVERNANCE_DIR="$GOVERNANCE_HOME"
 CONFIG_FILE="$GOVERNANCE_DIR/config.yml"
 # CLI root (parent of bin/); used to load rulesets/<stack>/<domain>_patterns.sh
 CLI_DIR=""
@@ -26,22 +26,22 @@ CURSOR_RULES_DIR=".cursor/rules"
 GOV_STACK_RULE="$CURSOR_RULES_DIR/governance-stack.mdc" # Governance entrypoint para Cursor (MDC format)
 GOV_SECURITY_RULE="$CURSOR_RULES_DIR/governance-security.mdc" # Security rules — carga con globs PHP/Smarty
 GOV_MODULES_RULE="$CURSOR_RULES_DIR/governance-modules.mdc"  # Arquitectura/convenciones — carga con globs modules/
-PIN_FILE=".iagt-governance.yml"
-GENERATED_FILE=".iagt-governance.yml.generated"
+PIN_FILE=".cursor-governance.yml"
+GENERATED_FILE=".cursor-governance.yml.generated"
 
 GITIGNORE_GLOBAL="$HOME/.gitignore_global"
 
 # Repos por defecto (SSH)
-DEFAULT_CORE_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-core.git"
-DEFAULT_PRESTASHOP_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-prestashop.git"
-DEFAULT_MAGENTO_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-magento.git"
+DEFAULT_CORE_REPO_SSH="git@github.com:inigo-munoz/cursor-governance-core.git"
+DEFAULT_PRESTASHOP_REPO_SSH="git@github.com:inigo-munoz/cursor-governance-prestashop8.git"
+DEFAULT_MAGENTO_REPO_SSH="git@github.com:inigo-munoz/cursor-governance-magento248.git"
 
 # Repos fallback (HTTPS)
-DEFAULT_CORE_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-core.git"
-DEFAULT_PRESTASHOP_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-prestashop.git"
-DEFAULT_MAGENTO_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-magento.git"
-DEFAULT_NODEJS_REPO_SSH="git@bitbucket.org:iagt-amazing-software/iagt-governance-nodejs.git"
-DEFAULT_NODEJS_REPO_HTTPS="https://bitbucket.org/iagt-amazing-software/iagt-governance-nodejs.git"
+DEFAULT_CORE_REPO_HTTPS="https://github.com/inigo-munoz/cursor-governance-core.git"
+DEFAULT_PRESTASHOP_REPO_HTTPS="https://github.com/inigo-munoz/cursor-governance-prestashop8.git"
+DEFAULT_MAGENTO_REPO_HTTPS="https://github.com/inigo-munoz/cursor-governance-magento248.git"
+DEFAULT_NODEJS_REPO_SSH="git@github.com:inigo-munoz/cursor-governance-nodejs.git"
+DEFAULT_NODEJS_REPO_HTTPS="https://github.com/inigo-munoz/cursor-governance-nodejs.git"
 
 # Variables globales para repos activos
 CORE_REPO=""
@@ -232,8 +232,8 @@ setup_gitignore_global() {
     changed=true
   fi
   
-  if ! grep -qxF '.iagt-governance.yml.generated' "$GITIGNORE_GLOBAL" 2>/dev/null; then
-    echo '.iagt-governance.yml.generated' >> "$GITIGNORE_GLOBAL"
+  if ! grep -qxF '.cursor-governance.yml.generated' "$GITIGNORE_GLOBAL" 2>/dev/null; then
+    echo '.cursor-governance.yml.generated' >> "$GITIGNORE_GLOBAL"
     changed=true
   fi
   
@@ -263,10 +263,10 @@ check_cursor_installed() {
   return 1
 }
 
-ensure_iagt_home() {
-  if [ ! -d "$IAGT_HOME" ]; then
-    mkdir -p "$IAGT_HOME"
-    log_info "Creado directorio: $IAGT_HOME"
+ensure_governance_home() {
+  if [ ! -d "$GOVERNANCE_HOME" ]; then
+    mkdir -p "$GOVERNANCE_HOME"
+    log_info "Creado directorio: $GOVERNANCE_HOME"
   fi
 }
 
@@ -308,7 +308,7 @@ resolve_active_stack() {
   detect_stack
 }
 
-# Return stack root directory: ~/.iagt/governance/<stack>
+# Return stack root directory: ~/.cursor-governance/<stack>
 get_stack_root() {
   local stack="$1"
   get_stack_dir "$stack"
@@ -403,7 +403,7 @@ app/config/parameters.yml
 .git/
 
 # Governance generado (no excluir .cursor/rules/)
-.iagt-governance.yml.generated
+.cursor-governance.yml.generated
 
 # Planes de sesión — no indexar automáticamente (usa @.cursor/plans/nombre.md para referenciar)
 .cursor/plans/
@@ -507,12 +507,12 @@ El plan se guarda aquí como `<feature>.md` y persiste entre sesiones.
 
 Para referenciar un plan en el chat:
 ```
-@.cursor/plans/iagt-counteroffer-refactor.md Continúa implementando desde donde lo dejé
+@.cursor/plans/acme-counteroffer-refactor.md Continúa implementando desde donde lo dejé
 ```
 
 ## Convención de nombres
 
-`<módulo>-<feature>.md` — ejemplo: `iagt-counteroffer-multishop.md`
+`<módulo>-<feature>.md` — ejemplo: `acme-counteroffer-multishop.md`
 
 ## Nota
 
@@ -645,10 +645,10 @@ setup_cursor_skills() {
         continue
         ;;
       lesson-review)
-        trigger_description="IAGT governance lesson review. Use when analyzing incidents, reviewing exceptions, or improving governance artifacts."
+        trigger_description="Governance lesson review. Use when analyzing incidents, reviewing exceptions, or improving governance artifacts."
         ;;
       *)
-        trigger_description="${skill_purpose:-IAGT ${skill_domain} skill for PrestaShop}. Use when working on ${skill_domain} in a PrestaShop IAGT project."
+        trigger_description="${skill_purpose:-${skill_domain} skill for PrestaShop}. Use when working on ${skill_domain} in a PrestaShop project."
         ;;
     esac
 
@@ -711,7 +711,7 @@ generate_modules_rule() {
   # Fallback si el manifest no tiene la sección cli.modules
   if [ -z "$globs" ]; then
     globs="**/*"
-    desc="IAGT ${stack} architecture and naming conventions"
+    desc="${stack^} architecture and naming conventions"
   fi
 
   local arch_file=""
@@ -720,7 +720,7 @@ generate_modules_rule() {
   # Archivos adicionales del manifest (cli.modules.additional)
   # Fallback: convenciones estándar
   local conv_file="$stack_dir/conventions/coding-conventions.md"
-  local ctx_file="$stack_dir/context/${stack}-iagt-context.md"
+  local ctx_file="$stack_dir/context/${stack}-context.md"
   local std_file="$stack_dir/standards/${stack}-development-standards.md"
 
   [ -f "$arch_file" ] || [ -f "$conv_file" ] || return 0
@@ -750,8 +750,8 @@ generate_agents_md() {
   [ -f "$agents_file" ] && return 0
 
   local stack_version=""
-  if [ -f ".iagt-governance.yml" ]; then
-    stack_version=$(grep "^stack_version:" ".iagt-governance.yml" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "")
+  if [ -f ".cursor-governance.yml" ]; then
+    stack_version=$(grep "^stack_version:" ".cursor-governance.yml" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "")
   fi
 
   # Usar template del catálogo si existe
@@ -764,15 +764,15 @@ generate_agents_md() {
 
   # Generar inline si no hay template
   {
-    echo "# AGENTS.md — IAGT ${stack^} Project"
+    echo "# AGENTS.md — ${stack^} Project"
     echo ""
-    echo "Stack: IAGT PrestaShop 8.x Legacy${stack_version:+ ($stack_version)}"
+    echo "Stack: PrestaShop 8.x Legacy${stack_version:+ ($stack_version)}"
     echo ""
     echo "## Architecture constraints"
     echo ""
     echo "- No namespaces, no Composer autoload, no Symfony DI"
-    echo "- Service Layer mandatory — business logic ONLY in classes/Iagt*Service.php"
-    echo "- All custom classes use \`Iagt\` prefix"
+    echo "- Service Layer mandatory — business logic ONLY in classes/Acme*Service.php"
+    echo "- All custom classes use \`Acme\` prefix"
     echo "- Multishop always — every query must filter by \`id_shop\`"
     echo "- Overrides prohibited — use hooks; exceptions require documentation"
     echo ""
@@ -803,8 +803,8 @@ generate_agents_md() {
     echo "| Task | Model |"
     echo "|------|-------|"
     echo "| Daily implementation | Composer 2 Fast |"
-    echo "| Architecture proposal (/iagt-sdd:new) | claude-sonnet-4-6 |"
-    echo "| Spec + verify (/iagt-sdd:continue) | claude-sonnet-4-6 |"
+    echo "| Architecture proposal (/sdd:new) | claude-sonnet-4-6 |"
+    echo "| Spec + verify (/sdd:continue) | claude-sonnet-4-6 |"
     echo "| Subagent auditors | Composer 2 Fast |"
     echo "| Complex/critical features | claude-opus-4-6 |"
     echo ""
@@ -813,8 +813,8 @@ generate_agents_md() {
     echo "## Verification"
     echo ""
     echo "\`\`\`bash"
-    echo "iagt-governance doctor"
-    echo "iagt-governance validate"
+    echo "cursor-governance doctor"
+    echo "cursor-governance validate"
     echo "\`\`\`"
   } > "$agents_file"
 
@@ -824,7 +824,7 @@ generate_agents_md() {
 # Generar .cursor/hooks.json con hooks de governance
 # - beforeShellExecution: bloquea/filtra comandos peligrosos
 # - afterFileEdit: detecta patrones de seguridad en PHP editado
-# - stop: ejecuta iagt-governance validate al terminar la sesión
+# - stop: ejecuta cursor-governance validate al terminar la sesión
 setup_cursor_hooks() {
   local hooks_file=".cursor/hooks.json"
   local hooks_dir=".cursor/hooks"
@@ -854,7 +854,7 @@ cmd=$(echo "$payload" | grep -o '"command":"[^"]*"' | sed 's/"command":"//;s/"//
 
 deny() {
   local msg="$1"
-  printf '{"continue":false,"permission":"deny","userMessage":"%s","agentMessage":"Command blocked by IAGT governance shell guard: %s"}\n' \
+  printf '{"continue":false,"permission":"deny","userMessage":"%s","agentMessage":"Command blocked by governance shell guard: %s"}\n' \
     "$msg" "$msg"
   exit 0
 }
@@ -884,9 +884,9 @@ echo "$cmd" | grep -qE "rm\s+-[rf]+\s+(/|./|classes/|controllers/|modules/)" && 
 echo "$cmd" | grep -qE "(cp|mv|sed|patch|echo).*(classes/|controllers/|init\.php|config\.php)" && \
   deny "Modification of PrestaShop core files blocked."
 
-# DROP TABLE / TRUNCATE sin prefijo iagt_
-echo "$cmd" | grep -qEi "(DROP\s+TABLE|TRUNCATE)\s+\`?ps_(?!iagt)" && \
-  deny "DROP/TRUNCATE on non-IAGT table blocked."
+# DROP TABLE / TRUNCATE sin prefijo acme_
+echo "$cmd" | grep -qEi "(DROP\s+TABLE|TRUNCATE)\s+\`?ps_(?!acme)" && \
+  deny "DROP/TRUNCATE on non-custom (core PrestaShop) table blocked."
 
 # ── CONFIRMACIÓN OBLIGATORIA ──────────────────────────────────────────────
 
@@ -965,8 +965,8 @@ HOOKEOF
 read -r payload
 status=$(echo "$payload" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
 [ "$status" != "completed" ] && exit 0
-command -v iagt-governance >/dev/null 2>&1 && \
-  iagt-governance validate --quiet 2>/dev/null || true
+command -v cursor-governance >/dev/null 2>&1 && \
+  cursor-governance validate --quiet 2>/dev/null || true
 echo '{}'
 HOOKEOF
   chmod +x "$hooks_dir/governance-stop.sh"
@@ -1450,7 +1450,7 @@ validate_pin_format() {
 
 cmd_self_update() {
   echo "============================================================"
-  echo "  IAGT Governance CLI — Actualización"
+  echo "  Cursor Governance CLI — Actualización"
   echo "============================================================"
   echo ""
 
@@ -1467,17 +1467,17 @@ cmd_self_update() {
   if [ -z "$repo_path" ] || [ ! -d "$repo_path" ]; then
     log_warn "No se encontró la ruta del repo del CLI en config.yml"
     echo ""
-    read -r -p "  Ruta del repo local del CLI (ej: /home/user/iagt-governance-cli): " repo_path
+    read -r -p "  Ruta del repo local del CLI (ej: /home/user/cursor-governance-cli): " repo_path
     echo ""
   fi
 
-  if [ ! -f "$repo_path/bin/iagt-governance" ]; then
-    log_error "No existe bin/iagt-governance en: $repo_path"
+  if [ ! -f "$repo_path/bin/cursor-governance" ]; then
+    log_error "No existe bin/cursor-governance en: $repo_path"
     log_error "Clona el repo primero y ejecuta ./install.sh"
     exit 1
   fi
 
-  [ -z "$binary_path" ] && binary_path="$HOME/.local/bin/iagt-governance"
+  [ -z "$binary_path" ] && binary_path="$HOME/.local/bin/cursor-governance"
 
   # Pull del repo
   log_info "Actualizando repo del CLI..."
@@ -1489,7 +1489,7 @@ cmd_self_update() {
 
   # Copiar binario
   log_info "Instalando binario en $binary_path..."
-  cp "$repo_path/bin/iagt-governance" "$binary_path"
+  cp "$repo_path/bin/cursor-governance" "$binary_path"
   chmod +x "$binary_path"
 
   echo ""
@@ -1500,18 +1500,18 @@ cmd_self_update() {
   log_info "Fuente: $repo_path"
   echo ""
   echo "  Si hay nuevos stacks en el registry:"
-  echo "  iagt-governance install"
+  echo "  cursor-governance install"
   echo ""
 }
 
 cmd_install() {
   echo "============================================================"
-  echo "  IAGT Governance — Instalación del catálogo local"
+  echo "  Cursor Governance — Instalación del catálogo local"
   echo "============================================================"
   echo ""
   
   check_dependencies
-  ensure_iagt_home
+  ensure_governance_home
   
   # Determinar protocolo (SSH o HTTPS)
   log_info "Verificando acceso a Bitbucket..."
@@ -1555,8 +1555,8 @@ cmd_install() {
     # Fallback hardcodeado si core no tiene registry aún
     log_warn "Registry no encontrado en core — usando lista por defecto"
     STACK_ORDER=("prestashop8" "nodejs22")
-    STACK_SSH[prestashop8]="git@bitbucket.org:iagt-amazing-software/iagt-governance-prestashop8.git"
-    STACK_HTTPS[prestashop8]="https://bitbucket.org/iagt-amazing-software/iagt-governance-prestashop8.git"
+    STACK_SSH[prestashop8]="git@github.com:inigo-munoz/cursor-governance-prestashop8.git"
+    STACK_HTTPS[prestashop8]="https://github.com/inigo-munoz/cursor-governance-prestashop8.git"
     STACK_LABEL[prestashop8]="PrestaShop 8.x"
     STACK_DIR[prestashop8]="prestashop8"
     STACK_SSH[nodejs22]="${DEFAULT_NODEJS_REPO_SSH}"
@@ -1634,15 +1634,15 @@ cmd_install() {
   # Crear config.yml
   # Detectar ruta del repo local del CLI
   local cli_repo_path=""
-  for _cand in     "/media/inigo/Loki/IAGT IA Repos/iagt-governance-cli"     "$HOME/iagt-governance-cli"     "$HOME/repos/iagt-governance-cli"; do
-    [ -f "$_cand/bin/iagt-governance" ] && cli_repo_path="$_cand" && break
+  for _cand in     "$HOME/cursor-governance-cli"     "$HOME/repos/cursor-governance-cli"; do
+    [ -f "$_cand/bin/cursor-governance" ] && cli_repo_path="$_cand" && break
   done
   local cli_binary_path
-  cli_binary_path=$(which iagt-governance 2>/dev/null || echo "$HOME/.local/bin/iagt-governance")
+  cli_binary_path=$(which cursor-governance 2>/dev/null || echo "$HOME/.local/bin/cursor-governance")
 
   cat > "$CONFIG_FILE" <<EOF
-# IAGT Governance — Configuración global
-# Generado automáticamente por iagt-governance install
+# Cursor Governance — Configuración global
+# Generado automáticamente por cursor-governance install
 
 repos:
   core: $CORE_REPO
@@ -1673,11 +1673,11 @@ EOF
   echo "Gitignore global:      $GITIGNORE_GLOBAL"
   echo ""
   echo "Próximo paso:"
-  echo "  cd /tu/proyecto && iagt-governance apply"
+  echo "  cd /tu/proyecto && cursor-governance apply"
   echo ""
   echo "Si es proyecto nuevo (ejemplos):"
-  echo "  PrestaShop 8: iagt-governance init --stack prestashop8 --core v2.2.0 --stack-version v2.4.0"
-  echo "  Node.js:      iagt-governance init --stack node --core v2.2.0 --stack-version v1.3.0"
+  echo "  PrestaShop 8: cursor-governance init --stack prestashop8 --core v2.2.0 --stack-version v2.4.0"
+  echo "  Node.js:      cursor-governance init --stack node --core v2.2.0 --stack-version v1.3.0"
   echo ""
 }
 
@@ -1688,13 +1688,13 @@ EOF
 cmd_init() {
   check_project_root "init"
   echo "============================================================"
-  echo "  IAGT Governance — Inicializar pin en proyecto nuevo"
+  echo "  Cursor Governance — Inicializar pin en proyecto nuevo"
   echo "============================================================"
   echo ""
   
   # Verificar catálogo instalado
   if [ ! -d "$GOVERNANCE_DIR" ]; then
-    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    log_error "Catálogo no instalado. Ejecuta: cursor-governance install"
     exit 1
   fi
   
@@ -1702,7 +1702,7 @@ cmd_init() {
   if [ -f "$PIN_FILE" ]; then
     log_error "$PIN_FILE ya existe"
     echo ""
-    echo "Si quieres cambiar versiones, usa: iagt-governance bump"
+    echo "Si quieres cambiar versiones, usa: cursor-governance bump"
     exit 1
   fi
   
@@ -1728,7 +1728,7 @@ cmd_init() {
       *)
         log_error "Argumento desconocido: $1"
         echo ""
-        echo "Uso: iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
+        echo "Uso: cursor-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
         exit 1
         ;;
     esac
@@ -1738,10 +1738,10 @@ cmd_init() {
   if [ -z "$stack" ] || [ -z "$core_version" ] || [ -z "$stack_version" ]; then
     log_error "Faltan argumentos obligatorios"
     echo ""
-    echo "Uso: iagt-governance init --stack <stack> --core <version> --stack-version <version>"
+    echo "Uso: cursor-governance init --stack <stack> --core <version> --stack-version <version>"
     echo ""
     echo "Ejemplo:"
-    echo "  iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
+    echo "  cursor-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5"
     echo ""
     echo "Stacks disponibles: prestashop, magento, node"
     exit 1
@@ -1811,7 +1811,7 @@ EOF
   cat "$PIN_FILE"
   echo ""
   echo "Próximos pasos:"
-  echo "  1. iagt-governance apply     # Generar rule"
+  echo "  1. cursor-governance apply     # Generar rule"
   echo "  2. git add $PIN_FILE"
   echo "  3. git commit -m 'chore: add governance pin'"
   echo ""
@@ -1840,7 +1840,7 @@ check_project_root() {
       echo ""
       echo "  Ejecuta el comando desde la raíz del proyecto:"
       echo "  cd "$dir""
-      echo "  iagt-governance ${1:-apply}"
+      echo "  cursor-governance ${1:-apply}"
       echo ""
       exit 1
     fi
@@ -1852,7 +1852,7 @@ check_project_root() {
 
 cmd_apply() {
   echo "============================================================"
-  echo "  IAGT Governance — Aplicar rule al proyecto"
+  echo "  Cursor Governance — Aplicar rule al proyecto"
   echo "============================================================"
   echo ""
 
@@ -1861,7 +1861,7 @@ cmd_apply() {
 
   # Verificar catálogo instalado (para modo pin y metadatos ricos)
   if [ ! -d "$GOVERNANCE_DIR" ]; then
-    log_warn "Catálogo global no instalado aún (~/.iagt/governance)."
+    log_warn "Catálogo global no instalado aún (~/.cursor-governance)."
   fi
   
   # MODO 1: Sin pin → auto-detección de stack y governance-stack.mdc (MDC format)
@@ -1908,11 +1908,11 @@ cmd_apply() {
 
     {
       echo "---"
-      echo "description: IAGT Governance — ${pretty_stack} stack (rules, security, architecture)"
+      echo "description: Cursor Governance — ${pretty_stack} stack (rules, security, architecture)"
       echo "alwaysApply: true"
       echo "---"
       echo ""
-      echo "# IAGT Governance — ${pretty_stack} Stack"
+      echo "# Cursor Governance — ${pretty_stack} Stack"
       echo ""
       echo "Stack: $auto_stack"
       echo "Version: (unpinned)"
@@ -1944,8 +1944,8 @@ cmd_apply() {
         echo "- architecture/${auto_stack}-legacy-architecture.md"
       [ -f "$stack_dir_display/multishop/MULTISHOP_DATA_MODEL.md" ] && \
         echo "- multishop/MULTISHOP_DATA_MODEL.md"
-      [ -f "$stack_dir_display/patterns/${auto_stack}-iagt-patterns.md" ] && \
-        echo "- patterns/${auto_stack}-iagt-patterns.md"
+      [ -f "$stack_dir_display/patterns/${auto_stack}-acme-patterns.md" ] && \
+        echo "- patterns/${auto_stack}-acme-patterns.md"
       [ -f "$stack_dir_display/conventions/CODING_CONVENTIONS.md" ] && \
         echo "- conventions/CODING_CONVENTIONS.md"
       echo ""
@@ -1974,7 +1974,7 @@ cmd_apply() {
     if [ -f "$stack_dir_display/security/${auto_stack}-security.md" ]; then
       {
         echo "---"
-        echo "description: IAGT ${pretty_stack} security rules — SQL injection, CSRF, uploads, locking"
+        echo "description: ${pretty_stack} security rules — SQL injection, CSRF, uploads, locking"
         echo "globs: \"**/*.php,**/*.tpl\""
         echo "alwaysApply: false"
         echo "---"
@@ -1984,7 +1984,7 @@ cmd_apply() {
       log_ok "Security rule generada: $GOV_SECURITY_RULE (globs: *.php, *.tpl)"
     fi
 
-    # Generar governance-modules.mdc con globs modules/iagt_*/
+    # Generar governance-modules.mdc con globs modules/acme_*/
     generate_modules_rule "$auto_stack" "$stack_dir_display"
 
     # Generar AGENTS.md en raíz del proyecto
@@ -2045,7 +2045,7 @@ cmd_apply() {
   
   if [ ! -d "$stack_dir" ]; then
     log_error "Stack '$stack' no está instalado en el catálogo."
-    log_error "Ejecuta: iagt-governance install"
+    log_error "Ejecuta: cursor-governance install"
     exit 1
   fi
   
@@ -2100,8 +2100,8 @@ cmd_apply() {
   
   # Generar archivo .generated (para referencia, no para usar como pin)
   cat > "$GENERATED_FILE" <<EOF
-# IAGT Governance — Estado generado
-# Generado por: iagt-governance apply
+# Cursor Governance — Estado generado
+# Generado por: cursor-governance apply
 # Fecha: $(date +%Y-%m-%d)
 #
 # Este archivo es INFORMATIVO. El pin real es $PIN_FILE.
@@ -2157,11 +2157,11 @@ EOF
 
   {
     echo "---"
-    echo "description: IAGT Governance — ${stack} stack (rules, security, architecture)"
+    echo "description: Cursor Governance — ${stack} stack (rules, security, architecture)"
     echo "alwaysApply: true"
     echo "---"
     echo ""
-    echo "# IAGT Governance — ${stack} Stack"
+    echo "# Cursor Governance — ${stack} Stack"
     echo ""
     echo "Stack: $stack"
     echo "Version: $stack_version"
@@ -2190,8 +2190,8 @@ EOF
       echo "- architecture/${stack}-legacy-architecture.md"
     [ -f "$stack_dir/multishop/MULTISHOP_DATA_MODEL.md" ] && \
       echo "- multishop/MULTISHOP_DATA_MODEL.md"
-    [ -f "$stack_dir/patterns/${stack}-iagt-patterns.md" ] && \
-      echo "- patterns/${stack}-iagt-patterns.md"
+    [ -f "$stack_dir/patterns/${stack}-acme-patterns.md" ] && \
+      echo "- patterns/${stack}-acme-patterns.md"
     [ -f "$stack_dir/conventions/CODING_CONVENTIONS.md" ] && \
       echo "- conventions/CODING_CONVENTIONS.md"
     if [ -n "$manifest_rel" ]; then
@@ -2225,7 +2225,7 @@ EOF
   if [ -z "$sec_file_rel" ]; then
     sec_file_rel="security/${stack}-security.md"
     sec_globs="**/*.php,**/*.tpl"
-    sec_desc="IAGT ${stack} security rules"
+    sec_desc="${stack^} security rules"
   fi
 
   sec_file="$stack_dir/$sec_file_rel"
@@ -2246,7 +2246,7 @@ EOF
     log_ok "Security rule generada: $GOV_SECURITY_RULE (globs: ${sec_globs})"
   fi
 
-  # Generar governance-modules.mdc con globs modules/iagt_*/
+  # Generar governance-modules.mdc con globs modules/acme_*/
   generate_modules_rule "$stack" "$stack_dir"
 
   # Generar AGENTS.md en raíz del proyecto
@@ -2293,7 +2293,7 @@ EOF
   echo "    .cursor/commands/  (commands del stack)"
   echo "    .cursor/skills/    (skills del stack)"
   echo "    .cursor/hooks.json + .cursor/hooks/ (hooks de governance)"
-  echo "    .iagt-governance.yml.generated"
+  echo "    .cursor-governance.yml.generated"
   [ -f ".cursorignore" ] && echo "    .cursorignore (si era nuevo — revisar antes de commitear)"
   echo ""
 }
@@ -2304,12 +2304,12 @@ EOF
 
 cmd_update() {
   echo "============================================================"
-  echo "  IAGT Governance — Actualizar catálogo local"
+  echo "  Cursor Governance — Actualizar catálogo local"
   echo "============================================================"
   echo ""
   
   if [ ! -d "$GOVERNANCE_DIR" ]; then
-    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    log_error "Catálogo no instalado. Ejecuta: cursor-governance install"
     exit 1
   fi
   
@@ -2338,8 +2338,8 @@ cmd_update() {
   echo ""
   echo "IMPORTANTE: update NO cambia el checkout actual."
   echo "Para aplicar una versión diferente, usa:"
-  echo "  iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
-  echo "  iagt-governance apply"
+  echo "  cursor-governance bump --core vX.Y.Z --stack vX.Y.Z"
+  echo "  cursor-governance apply"
   echo ""
 }
 
@@ -2349,13 +2349,13 @@ cmd_update() {
 
 cmd_bump() {
   echo "============================================================"
-  echo "  IAGT Governance — Actualizar pin de versiones"
+  echo "  Cursor Governance — Actualizar pin de versiones"
   echo "============================================================"
   echo ""
   
   # Verificar catálogo instalado
   if [ ! -d "$GOVERNANCE_DIR" ]; then
-    log_error "Catálogo no instalado. Ejecuta: iagt-governance install"
+    log_error "Catálogo no instalado. Ejecuta: cursor-governance install"
     exit 1
   fi
   
@@ -2376,7 +2376,7 @@ cmd_bump() {
       *)
         log_error "Argumento desconocido: $1"
         echo ""
-        echo "Uso: iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
+        echo "Uso: cursor-governance bump --core vX.Y.Z --stack vX.Y.Z"
         exit 1
         ;;
     esac
@@ -2385,7 +2385,7 @@ cmd_bump() {
   if [ -z "$new_core" ] && [ -z "$new_stack" ]; then
     log_error "Debes especificar al menos --core o --stack"
     echo ""
-    echo "Uso: iagt-governance bump --core vX.Y.Z --stack vX.Y.Z"
+    echo "Uso: cursor-governance bump --core vX.Y.Z --stack vX.Y.Z"
     exit 1
   fi
   
@@ -2490,8 +2490,8 @@ EOF
   echo "============================================================"
   echo ""
   echo "Próximos pasos:"
-  echo "  1. iagt-governance apply     # Regenerar rule con nuevas versiones"
-  echo "  2. iagt-governance verify    # Verificar integridad"
+  echo "  1. cursor-governance apply     # Regenerar rule con nuevas versiones"
+  echo "  2. cursor-governance verify    # Verificar integridad"
   echo "  3. git add $PIN_FILE"
   echo "  4. git commit -m 'chore: update governance to $final_core / $final_stack_version'"
   echo ""
@@ -2504,7 +2504,7 @@ EOF
 cmd_status() {
   check_project_root "status"
   echo "============================================================"
-  echo "  IAGT Governance — Estado del proyecto"
+  echo "  Cursor Governance — Estado del proyecto"
   echo "============================================================"
   echo ""
   
@@ -2518,7 +2518,7 @@ cmd_status() {
   echo "Stack:      $stack"
   echo ""
   
-  # .iagt-governance.yml (pin file)
+  # .cursor-governance.yml (pin file)
   if [ -f "$PIN_FILE" ]; then
     echo "[OK]   $PIN_FILE existe (pin de versiones)"
     grep -E "^(stack|core|stack_version):" "$PIN_FILE" 2>/dev/null | sed 's/^/       /'
@@ -2526,21 +2526,21 @@ cmd_status() {
     echo "[WARN] $PIN_FILE no existe (sin pin de versiones)"
   fi
   
-  # .iagt-governance.yml.generated
+  # .cursor-governance.yml.generated
   if [ -f "$GENERATED_FILE" ]; then
     echo "[OK]   $GENERATED_FILE existe"
     local applied
     applied=$(grep "^applied_at:" "$GENERATED_FILE" 2>/dev/null | cut -d' ' -f2 || echo "")
     [ -n "$applied" ] && echo "       Generado: $applied"
   else
-    echo "[INFO] $GENERATED_FILE no existe (ejecuta: iagt-governance apply)"
+    echo "[INFO] $GENERATED_FILE no existe (ejecuta: cursor-governance apply)"
   fi
   
   # .cursor/rules (governance entrypoint para Cursor)
   if [ -f "$GOV_STACK_RULE" ]; then
     echo "[OK]   $GOV_STACK_RULE existe (governance entrypoint)"
   else
-    echo "[FAIL] No existe $GOV_STACK_RULE (ejecuta: iagt-governance apply)"
+    echo "[FAIL] No existe $GOV_STACK_RULE (ejecuta: cursor-governance apply)"
   fi
   
   # Catálogo
@@ -2568,7 +2568,7 @@ cmd_status() {
 cmd_verify() {
   check_project_root "verify"
   echo "============================================================"
-  echo "  IAGT Governance — Verificar integridad"
+  echo "  Cursor Governance — Verificar integridad"
   echo "============================================================"
   echo ""
 
@@ -2577,7 +2577,7 @@ cmd_verify() {
   # 1. Entrypoint MDC existe y tiene alwaysApply
   if [ ! -f "$GOV_STACK_RULE" ]; then
     log_error "No existe governance-stack.mdc en $CURSOR_RULES_DIR"
-    echo "       Ejecuta: iagt-governance apply"
+    echo "       Ejecuta: cursor-governance apply"
     exit 1
   fi
   if grep -q "alwaysApply: true" "$GOV_STACK_RULE" 2>/dev/null; then
@@ -2596,7 +2596,7 @@ cmd_verify() {
       exit_code=1
     fi
   else
-    log_warn "No existe governance-security.mdc — ejecuta: iagt-governance apply"
+    log_warn "No existe governance-security.mdc — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2604,7 +2604,7 @@ cmd_verify() {
   if [ -f "$GOV_MODULES_RULE" ]; then
     log_ok "Modules rule MDC: $GOV_MODULES_RULE (globs)"
   else
-    log_warn "No existe governance-modules.mdc — ejecuta: iagt-governance apply"
+    log_warn "No existe governance-modules.mdc — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2642,7 +2642,7 @@ cmd_verify() {
   if [ "$cmd_count" -gt 0 ]; then
     log_ok "Commands: $cmd_count en .cursor/commands/"
   else
-    log_warn "No hay commands en .cursor/commands/ — ejecuta: iagt-governance apply"
+    log_warn "No hay commands en .cursor/commands/ — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2652,7 +2652,7 @@ cmd_verify() {
   if [ "$skill_count" -gt 0 ]; then
     log_ok "Skills: $skill_count en .cursor/skills/"
   else
-    log_warn "No hay skills en .cursor/skills/ — ejecuta: iagt-governance apply"
+    log_warn "No hay skills en .cursor/skills/ — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2660,7 +2660,7 @@ cmd_verify() {
   if [ -f ".cursor/hooks.json" ]; then
     log_ok "Hooks: .cursor/hooks.json existe"
   else
-    log_warn "No existe .cursor/hooks.json — ejecuta: iagt-governance apply"
+    log_warn "No existe .cursor/hooks.json — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2668,7 +2668,7 @@ cmd_verify() {
   if [ -f "AGENTS.md" ]; then
     log_ok "AGENTS.md existe en raíz"
   else
-    log_warn "No existe AGENTS.md — ejecuta: iagt-governance apply"
+    log_warn "No existe AGENTS.md — ejecuta: cursor-governance apply"
     exit_code=1
   fi
 
@@ -2676,7 +2676,7 @@ cmd_verify() {
   if [ $exit_code -eq 0 ]; then
     echo "✅ VERIFICACIÓN EXITOSA"
   else
-    echo "⚠️  VERIFICACIÓN CON ADVERTENCIAS — ejecuta: iagt-governance apply"
+    echo "⚠️  VERIFICACIÓN CON ADVERTENCIAS — ejecuta: cursor-governance apply"
   fi
   echo ""
 
@@ -2689,7 +2689,7 @@ cmd_verify() {
 
 cmd_doctor() {
   echo "============================================================"
-  echo "  IAGT Governance — Diagnóstico del sistema"
+  echo "  Cursor Governance — Diagnóstico del sistema"
   echo "============================================================"
   echo ""
   
@@ -2734,7 +2734,7 @@ cmd_doctor() {
     done
   else
     log_error "Catálogo NO instalado"
-    echo "       Ejecuta: iagt-governance install"
+    echo "       Ejecuta: cursor-governance install"
     ((issues++))
   fi
   
@@ -2751,7 +2751,7 @@ cmd_doctor() {
     fi
   else
     log_warn "Gitignore global NO configurado"
-    echo "       Ejecuta: iagt-governance install (lo configura automáticamente)"
+    echo "       Ejecuta: cursor-governance install (lo configura automáticamente)"
   fi
   
   # 5. Cursor
@@ -2783,7 +2783,7 @@ cmd_doctor() {
         log_ok "  Core checkout coincide con pin"
       else
         log_warn "  Core checkout ($current_core) ≠ pin ($pin_core)"
-        echo "         Ejecuta: iagt-governance apply"
+        echo "         Ejecuta: cursor-governance apply"
       fi
     fi
     
@@ -2796,7 +2796,7 @@ cmd_doctor() {
         log_ok "  $pin_stack checkout coincide con pin"
       else
         log_warn "  $pin_stack checkout ($current_stack) ≠ pin ($pin_stack_ver)"
-        echo "         Ejecuta: iagt-governance apply"
+        echo "         Ejecuta: cursor-governance apply"
       fi
     fi
 
@@ -2816,8 +2816,8 @@ cmd_doctor() {
     log_warn "Sin pin en este directorio"
     echo "       WARNING: Project is not pinned to a governance version."
     echo "       Recommended command:"
-    echo "         iagt-governance apply"
-    echo "       Si es proyecto nuevo: iagt-governance init ..."
+    echo "         cursor-governance apply"
+    echo "       Si es proyecto nuevo: cursor-governance init ..."
     # Intentar detectar stack por estructura aunque no haya pin
     local struct_stack
     if struct_stack=$(detect_stack_by_structure); then
@@ -2839,22 +2839,22 @@ cmd_doctor() {
         log_warn "  governance-stack.mdc existe pero sin alwaysApply — ejecuta: apply"
       fi
     else
-      log_warn "  governance-stack.mdc NO existe — ejecuta: iagt-governance apply"
+      log_warn "  governance-stack.mdc NO existe — ejecuta: cursor-governance apply"
     fi
     # governance-security.mdc
     if [ -f "$GOV_SECURITY_RULE" ]; then
       log_ok "  governance-security.mdc (globs activos)"
     else
-      log_warn "  governance-security.mdc NO existe — ejecuta: iagt-governance apply"
+      log_warn "  governance-security.mdc NO existe — ejecuta: cursor-governance apply"
     fi
     # governance-modules.mdc
     if [ -f "$GOV_MODULES_RULE" ]; then
       log_ok "  governance-modules.mdc (globs activos)"
     else
-      log_warn "  governance-modules.mdc NO existe — ejecuta: iagt-governance apply"
+      log_warn "  governance-modules.mdc NO existe — ejecuta: cursor-governance apply"
     fi
   else
-    log_warn "  .cursor/rules/ NO existe — ejecuta: iagt-governance apply"
+    log_warn "  .cursor/rules/ NO existe — ejecuta: cursor-governance apply"
     ((issues++))
   fi
 
@@ -2864,7 +2864,7 @@ cmd_doctor() {
   if [ "$cmd_count" -gt 0 ]; then
     log_ok "  .cursor/commands/: $cmd_count commands"
   else
-    log_warn "  .cursor/commands/: vacío — ejecuta: iagt-governance apply"
+    log_warn "  .cursor/commands/: vacío — ejecuta: cursor-governance apply"
   fi
 
   # skills
@@ -2873,28 +2873,28 @@ cmd_doctor() {
   if [ "$skill_count" -gt 0 ]; then
     log_ok "  .cursor/skills/: $skill_count skills"
   else
-    log_warn "  .cursor/skills/: vacío — ejecuta: iagt-governance apply"
+    log_warn "  .cursor/skills/: vacío — ejecuta: cursor-governance apply"
   fi
 
   # hooks
   if [ -f ".cursor/hooks.json" ]; then
     log_ok "  .cursor/hooks.json: configurado"
   else
-    log_warn "  .cursor/hooks.json: NO existe — ejecuta: iagt-governance apply"
+    log_warn "  .cursor/hooks.json: NO existe — ejecuta: cursor-governance apply"
   fi
 
   # AGENTS.md
   if [ -f "AGENTS.md" ]; then
     log_ok "  AGENTS.md: existe en raíz"
   else
-    log_warn "  AGENTS.md: NO existe — ejecuta: iagt-governance apply"
+    log_warn "  AGENTS.md: NO existe — ejecuta: cursor-governance apply"
   fi
 
   # .cursorignore
   if [ -f ".cursorignore" ]; then
     log_ok "  .cursorignore: existe"
   else
-    log_warn "  .cursorignore: NO existe — ejecuta: iagt-governance apply"
+    log_warn "  .cursorignore: NO existe — ejecuta: cursor-governance apply"
   fi
   
   echo ""
@@ -2934,7 +2934,7 @@ cmd_validate_project() {
   local STACK_DIR
   STACK_DIR=$(get_stack_root "$stack")
   if [ ! -d "$STACK_DIR" ]; then
-    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: iagt-governance install"
+    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: cursor-governance install"
     exit 1
   fi
 
@@ -3074,11 +3074,11 @@ cmd_validate() {
   echo "Stack: $stack"
   echo ""
 
-  # 2. Resolver directorio del stack: ~/.iagt/governance/<stack>
+  # 2. Resolver directorio del stack: ~/.cursor-governance/<stack>
   local STACK_DIR
   STACK_DIR=$(get_stack_root "$stack")
   if [ ! -d "$STACK_DIR" ]; then
-    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: iagt-governance install"
+    log_error "Stack '$stack' no está instalado en el catálogo. Ejecuta: cursor-governance install"
     exit 1
   fi
 
@@ -3207,13 +3207,13 @@ cmd_validate() {
 
 show_help() {
   cat <<EOF
-iagt-governance — CLI para gestión de gobernanza multi-stack
+cursor-governance — CLI para gestión de gobernanza multi-stack
 
 USO:
-  iagt-governance <comando>
+  cursor-governance <comando>
 
 COMANDOS:
-  install     Instala catálogo local (~/.iagt/governance/)
+  install     Instala catálogo local (~/.cursor-governance/)
   init        Crea pin inicial en proyecto nuevo
   apply       Genera .cursor/rules/governance-stack.mdc según el pin o auto-detección
   update      Actualiza stacks del catálogo local (git pull)
@@ -3228,34 +3228,34 @@ COMANDOS:
   help        Muestra esta ayuda
 
 ARCHIVOS:
-  .iagt-governance.yml           Pin de versiones (COMMITEAR)
-  .iagt-governance.yml.generated Estado local generado (NO commitear)
+  .cursor-governance.yml           Pin de versiones (COMMITEAR)
+  .cursor-governance.yml.generated Estado local generado (NO commitear)
   .cursor/rules/governance-stack.mdc  Governance entrypoint (MDC format) (NO commitear)
 
 PROYECTO NUEVO:
-  iagt-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5
-  iagt-governance apply
-  git add .iagt-governance.yml
+  cursor-governance init --stack prestashop --core v2.1.1 --stack-version v2.0.5
+  cursor-governance apply
+  git add .cursor-governance.yml
   git commit -m "chore: add governance pin"
 
 PROYECTO EXISTENTE (clonar):
   git clone ...
   cd proyecto
-  iagt-governance apply
+  cursor-governance apply
 
 ACTUALIZAR VERSIONES:
-  iagt-governance update
-  iagt-governance bump --core v2.2.0 --stack v2.1.0
-  iagt-governance apply
-  iagt-governance verify
-  git add .iagt-governance.yml
+  cursor-governance update
+  cursor-governance bump --core v2.2.0 --stack v2.1.0
+  cursor-governance apply
+  cursor-governance verify
+  git add .cursor-governance.yml
   git commit -m "chore: update governance"
 
 DIAGNÓSTICO:
-  iagt-governance doctor
+  cursor-governance doctor
 
 VARIABLES DE ENTORNO:
-  IAGT_HOME   Directorio base (default: ~/.iagt)
+  GOVERNANCE_HOME   Directorio base (default: ~/.cursor-governance)
 
 EOF
 }

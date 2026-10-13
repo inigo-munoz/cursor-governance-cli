@@ -34,8 +34,8 @@ Cómo gestionar actualizaciones de governance a nivel de equipo.
 2. Evalúa changelog
 3. Decide: adoptar ahora / después / nunca
 4. Si adopta:
-   - iagt-governance update
-   - iagt-governance bump --core vX.Y.Z --stack vX.Y.Z
+   - cursor-governance update
+   - cursor-governance bump --core vX.Y.Z --stack vX.Y.Z
    - cursor-governance apply
    - Prueba
    - PR con nuevo pin
@@ -124,8 +124,8 @@ Reglas:
 ```bash
 # Script para auditar todos los proyectos
 for project in /proyectos/*; do
-  if [ -f "$project/.iagt-governance.yml" ]; then
-    echo "$project: $(grep stack_version $project/.iagt-governance.yml)"
+  if [ -f "$project/.cursor-governance.yml" ]; then
+    echo "$project: $(grep stack_version $project/.cursor-governance.yml)"
   fi
 done
 ```
